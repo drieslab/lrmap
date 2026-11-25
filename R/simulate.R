@@ -18,12 +18,14 @@
 #' @param leak_R express R in A instead of B (leak scenario).
 #' @param gap width of the C ring in the `gap` layout (microns).
 #' @param n_genes decoy genes. @param n_decoy decoy pairs. @param lib_mean mean library size.
+#' @param induce interface induction: `L` in A cells and `R` in B cells scale with (1 + `induce` x the cell's
+#'   contact share of the other type), renormalised to the same type mean (0: expression is type-level only).
 #' @param seed random seed.
 #' @return list(counts (genes x cells), coords, types, lib, lr, leak (table of the true coefficients)).
 #' @export
 lrmap_simulate <- function(layout = c("touch", "gap", "far", "indep"), size = 1500, spacing = 15, n_clusters = 20,
                            r_a = 40, mu_l = 4, mu_r = 4, leak = 0, leak_R = FALSE, n_genes = 30, n_decoy = 40, gap = 35,
-                           lib_mean = 300, seed = 1) {
+                           lib_mean = 300, induce = 0, seed = 1) {
   layout <- match.arg(layout); set.seed(seed)
   ys <- seq(0, size, by = spacing * sqrt(3) / 2)
   xy <- do.call(rbind, lapply(seq_along(ys), function(r) cbind(seq(if (r %% 2) 0 else spacing / 2, size, by = spacing), ys[r])))
@@ -65,6 +67,14 @@ lrmap_simulate <- function(layout = c("touch", "gap", "far", "indep"), size = 15
   prof <- rbind(prof, G)
   E <- t(prof[, tc, drop = FALSE]) / lib_mean                                     # cells x genes, fraction of library
   E[, -(1:2)] <- E[, -(1:2)] * vapply(seq_len(n_genes), function(g) smooth(), numeric(n))
+  if (induce > 0) {                                                   # interface induction of L (in A) and R (in B)
+    nn <- RANN::nn2(xy, k = 9); nb <- tc[nn$nn.idx[, -1]]; dim(nb) <- c(n, 8)
+    sh <- function(t) rowMeans(nb == t)
+    for (g in list(c("L", 1, 2), c("R", 2, 1))) {
+      own <- tc == as.integer(g[2]); f <- 1 + induce * sh(as.integer(g[3]))
+      E[own, g[1]] <- E[own, g[1]] * f[own] / mean(f[own])
+    }
+  }
   if (leak > 0) {
     nn <- RANN::nn2(xy, k = 9); recv <- rep(seq_len(n), 8); send <- as.vector(nn$nn.idx[, -1])
     d <- as.vector(nn$nn.dists[, -1]); w <- exp(-d / stats::median(d)); wn <- w / .rsum(w, recv, n)[recv]

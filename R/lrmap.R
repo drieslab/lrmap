@@ -54,6 +54,14 @@
 #' @param backend "auto" uses the compiled kernels of the lrmaprs package when it is installed.
 #' @param threads threads for the compiled kernels (1: the calling thread only; 0: all cores).
 #' @param seed seed for the shifts. @param verbose progress messages.
+#' @details Three tests are reported for every spatial row. `q` (with `z`, `fold`): co-location of ligand-expressing
+#'   senders and receptor-expressing receivers against shifted sender layers; this includes the co-location of
+#'   the two cell types, so any pair expressed in two neighbouring types is called. `q_type` (with `z_type`,
+#'   `fold_type`; the default of [lrmap_results()]): co-location beyond that of the two cell types, i.e. whether
+#'   ligand-high senders sit nearer receptor-high receivers than other cells of the two types do, calibrated by
+#'   the same shifts. `q_shuffle`: the same question against shuffling ligand and receptor values within their
+#'   cell types (layout fixed, exact moments); it ignores smooth spatial trends of expression and is
+#'   anti-conservative when they are present.
 #' @return an `LRmap` object: `table` (one row per tested sender, receiver, pair and scale), `coloc`
 #'   (type-level co-location per scale), `n_pairs`, `n_covered`, `settings`, `timing`.
 #' @export
@@ -93,12 +101,22 @@ lrmap <- function(counts, coords, types, lr, lib = NULL, scales = c("contact", "
   if (!nrow(tab)) stop("no ligand-receptor pair has all its genes in counts")
   Y <- Matrix::Diagonal(x = 100 / lib) %*% Matrix::t(Xg[unique(unlist(c(tab$lg, tab$rg))), , drop = FALSE])
   rm(Xg)
-  Le <- .entities_sparse(tab$ligand, tab$lg, Y, "min"); Re <- .entities_sparse(tab$receptor, tab$rg, Y, "mean")
-  subL <- tab$lg[match(colnames(Le$E), tab$ligand)]; subR <- tab$rg[match(colnames(Re$E), tab$receptor)]
-  # sampling variance per cell: Poisson on the composition scale (y * 100 / lib; mean of k subunits: / k)
-  pv <- 100 / lib
-  VL <- Matrix::Diagonal(x = pv) %*% Le$E; VR <- Matrix::Diagonal(x = pv) %*% Re$E %*% Matrix::Diagonal(x = 1 / Re$k)
-  Ty <- Matrix::sparseMatrix(i = tcode, j = seq_len(n), x = 1, dims = c(K, n))
+  # entities: ligand = minimum over its subunit genes, receptor = mean. No all-cell entity matrices are built:
+  # values, sampling variances and detection are formed per cell type from Y, in chunks of entities.
+  Ln <- unique(tab$ligand); Rn <- unique(tab$receptor)
+  subL <- tab$lg[match(Ln, tab$ligand)]; subR <- tab$rg[match(Rn, tab$receptor)]; nl <- length(Ln); nr <- length(Rn)
+  pv <- 100 / lib                                     # Poisson variance on the composition scale: y * 100 / lib
+  # detection per type: share of cells with every subunit detected
+  det_ent <- function(sub) {
+    out <- matrix(0, K, length(sub)); one <- lengths(sub) == 1
+    if (any(one)) {
+      g1 <- vapply(sub[one], `[`, "", 1); Yd <- Y[, g1, drop = FALSE]; Yd@x <- as.numeric(Yd@x > 0)
+      out[, one] <- as.matrix(Matrix::sparseMatrix(i = tcode, j = seq_len(n), x = 1, dims = c(K, n)) %*% Yd)
+    }
+    for (j in which(!one)) out[, j] <- tabulate(tcode[Matrix::rowSums(Y[, sub[[j]], drop = FALSE] > 0) == length(sub[[j]])], K)
+    out / nt
+  }
+  detL <- det_ent(subL); detR <- det_ent(subR)
   lc <- NULL
   if (!is.null(leak)) {   # leak removal per gene (y - W y - cmu * a_t), before ligand / receptor values are formed
     ct <- if (is.null(spill_edges)) NULL else {
@@ -107,17 +125,33 @@ lrmap <- function(counts, coords, types, lr, lib = NULL, scales = c("contact", "
     lw <- .leak_W(ct, tcode, .leak_mats(leak, lev))
     ex <- .lk_exposures(coords, tcode, K, utils::modifyList(LEAK_DEF, list(k = k)), rs)
     a <- .lk_intercepts(.lk_designs(ex, tcode, K, lib, LEAK_DEF$min_cells), Y, K); a[is.na(a)] <- 0; rm(ex)
-    lc <- list(Y = Y, WY = lw$W %*% Y, cmu = lw$cmu, a = a)
-    VL <- VL + lw$W2 %*% VL; VR <- VR + lw$W2 %*% VR; rm(lw)
+    lc <- list(WY = lw$W %*% Y, cmu = lw$cmu, a = a, W2 = lw$W2); rm(lw)
   }
-  rm(Y)
-  detL <- as.matrix(Ty %*% Le$D) / nt; detR <- as.matrix(Ty %*% Re$D) / nt
-  Lc <- Le$E; Rc <- Re$E
-  nl <- ncol(Lc); nr <- ncol(Rc)
+  # entity values for cells r (of type t when leak-corrected), chunks of 100 entities
+  ent_vals <- function(sub, fun, r, t, corrected = TRUE) {
+    do.call(cbind, lapply(split(seq_along(sub), ceiling(seq_along(sub) / 100)), function(ii) {
+      g <- unique(unlist(sub[ii])); G <- as.matrix(Y[r, g, drop = FALSE])
+      if (corrected && !is.null(lc)) G <- G - as.matrix(lc$WY[r, g, drop = FALSE]) - outer(lc$cmu[r], lc$a[t, g])
+      colnames(G) <- g
+      matrix(vapply(sub[ii], function(s) if (length(s) == 1) G[, s] else if (fun == "min")
+                    do.call(pmin, as.data.frame(G[, s, drop = FALSE])) else rowMeans(G[, s, drop = FALSE]),
+                    numeric(length(r))), nrow = length(r))
+    }))
+  }
+  # sampling variance: Poisson of the raw entity (mean of k subunits: / k), plus that of the removed leak (W2)
+  ent_var <- function(sub, fun, r) {
+    kd <- if (fun == "mean") lengths(sub) else rep(1, length(sub))
+    V <- pv[r] * sweep(ent_vals(sub, fun, r, NA, FALSE), 2, kd, "/")
+    if (!is.null(lc)) {
+      W2r <- lc$W2[r, , drop = FALSE]; nb <- which(Matrix::colSums(W2r) > 0)
+      if (length(nb)) V <- V + as.matrix(W2r[, nb, drop = FALSE] %*% (pv[nb] * sweep(ent_vals(sub, fun, nb, NA, FALSE), 2, kd, "/")))
+    }
+    V
+  }
 
   # tests: every (sender A, receiver B, pair) passing the expression filters, plus the type-level rows (.cells,
   # entity index nl + 1 / nr + 1)
-  li <- c(match(tab$ligand, colnames(Lc)), nl + 1L); ri <- c(match(tab$receptor, colnames(Rc)), nr + 1L)
+  li <- c(match(tab$ligand, Ln), nl + 1L); ri <- c(match(tab$receptor, Rn), nr + 1L)
   dL <- cbind(detL, 1); dR <- cbind(detR, 1); ok_t <- nt >= min_cells
   tests <- do.call(rbind, lapply(seq_along(li), function(p) {
     g <- expand.grid(A = which(ok_t & dL[, li[p]] >= min_det), Bt = which(ok_t & dR[, ri[p]] >= min_det))
@@ -128,52 +162,35 @@ lrmap <- function(counts, coords, types, lr, lib = NULL, scales = c("contact", "
   say("%d of %d pairs covered; %d sender-receiver-pair tests per scale", tb$n_covered, tb$n,
       sum(tests$p <= nrow(tab)))
 
-  # dense blocks: per type, only the entities it is tested with (values and their variances). With leak removal
-  # the subunit genes are corrected first and the entities formed from them (in chunks of entities).
-  ent_dense <- function(sub, fun, r, t) {
-    do.call(cbind, lapply(split(seq_along(sub), ceiling(seq_along(sub) / 100)), function(ii) {
-      g <- unique(unlist(sub[ii]))
-      G <- as.matrix(lc$Y[r, g, drop = FALSE]) - as.matrix(lc$WY[r, g, drop = FALSE]) - outer(lc$cmu[r], lc$a[t, g])
-      colnames(G) <- g
-      vapply(sub[ii], function(s) if (length(s) == 1) G[, s] else if (fun == "min") do.call(pmin, as.data.frame(G[, s]))
-             else rowMeans(G[, s]), numeric(length(r)))
-    }))
-  }
-  blk <- function(E, V, sub, fun, idx, side) {
+  # dense blocks: per type, only the entities it is tested with (values and their variances)
+  blk <- function(sub, fun, nent, idx, side) {
     lapply(seq_len(K), function(t) {
       cols <- sort(unique(idx[tests[[side]] == t])); if (!length(cols)) return(NULL)
-      ent <- cols[cols <= ncol(E)]; r <- rng[[t]]
+      ent <- cols[cols <= nent]; r <- rng[[t]]
       M <- matrix(1, length(r), length(cols)); Vv <- matrix(0, length(r), length(cols))
-      if (length(ent)) {
-        w <- match(ent, cols)
-        M[, w] <- if (is.null(lc)) as.matrix(E[r, ent, drop = FALSE]) else ent_dense(sub[ent], fun, r, t)
-        Vv[, w] <- as.matrix(V[r, ent, drop = FALSE])
-      }
+      if (length(ent)) { w <- match(ent, cols); M[, w] <- ent_vals(sub[ent], fun, r, t); Vv[, w] <- ent_var(sub[ent], fun, r) }
       list(M = M, V = Vv, cols = cols)
     })
   }
-  Lb <- blk(Lc, VL, subL, "min", tests$li, "A"); Rb <- blk(Rc, VR, subR, "mean", tests$ri, "Bt")
+  Lb <- blk(subL, "min", nl, tests$li, "A"); Rb <- blk(subR, "mean", nr, tests$ri, "Bt")
   # expression-only reference: mean and variance of every tested entity over all cells (label-shuffle null)
-  est <- function(E, sub, fun, ents) {
+  est <- function(sub, fun, nent, ents) {
     s1 <- s2 <- numeric(length(ents))
-    if (is.null(lc)) { Es <- E[, ents, drop = FALSE]; s1 <- Matrix::colSums(Es); s2 <- Matrix::colSums(Es^2) }
-    else for (ii in split(seq_along(ents), ceiling(seq_along(ents) / 100))) for (t in seq_len(K)) {
-      M <- ent_dense(sub[ents[ii]], fun, rng[[t]], t); s1[ii] <- s1[ii] + colSums(M); s2[ii] <- s2[ii] + colSums(M^2)
+    for (ii in split(seq_along(ents), ceiling(seq_along(ents) / 100))) for (t in seq_len(K)) {
+      M <- ent_vals(sub[ents[ii]], fun, rng[[t]], t); s1[ii] <- s1[ii] + colSums(M); s2[ii] <- s2[ii] + colSums(M^2)
     }
-    m <- s1 / n; v <- numeric(ncol(E) + 1L); mm <- numeric(ncol(E) + 1L)
-    mm[ents] <- m; v[ents] <- pmax(s2 / n - m^2, 0); list(mean = mm, var = v)
+    m <- s1 / n; v <- mm <- numeric(nent + 1L); mm[ents] <- m; v[ents] <- pmax(s2 / n - m^2, 0); list(mean = mm, var = v)
   }
   if ("expression" %in% scales) {
     xt <- tests$p <= nrow(tab)
-    stL <- est(Lc, subL, "min", sort(unique(tests$li[xt]))); stR <- est(Rc, subR, "mean", sort(unique(tests$ri[xt])))
+    stL <- est(subL, "min", nl, sort(unique(tests$li[xt]))); stR <- est(subR, "mean", nr, sort(unique(tests$ri[xt])))
   }
-  rm(lc)
+  rm(lc, Y); invisible(gc(FALSE))
   bmean <- function(Bl, ncol_) { m <- matrix(NA_real_, K, ncol_)
     for (t in seq_len(K)) if (!is.null(Bl[[t]])) m[t, Bl[[t]]$cols] <- colMeans(Bl[[t]]$M); m }
   mLx <- bmean(Lb, nl + 1L); mRx <- bmean(Rb, nr + 1L)
   tests$lc <- vapply(seq_len(nrow(tests)), function(i) match(tests$li[i], Lb[[tests$A[i]]]$cols), 1L)
   tests$rc <- vapply(seq_len(nrow(tests)), function(i) match(tests$ri[i], Rb[[tests$Bt[i]]]$cols), 1L)
-  rm(Lc, Rc, VL, VR, Le, Re)
   say("blocks: %.0f MB", (sum(vapply(Lb, function(b) if (is.null(b)) 0 else length(b$M), 1)) +
                             sum(vapply(Rb, function(b) if (is.null(b)) 0 else length(b$M), 1))) * 16 / 2^20)
 
@@ -186,25 +203,45 @@ lrmap <- function(counts, coords, types, lr, lib = NULL, scales = c("contact", "
   sh <- .shifts(B, box, min_shift, seed)
   ctx <- list(coords = coords, tcode = tcode, K = K, off = off, rng = rng, Lb = Lb, Rb = Rb, tests = tests,
               sh = sh, box = box, rs = rs)
+  # per test: mean and sum of squares of the ligand over sender cells and the receptor over receiver cells; the
+  # type-level (.cells) row of the same sender / receiver
+  bst <- function(Bl, typ, col) {
+    m <- ss <- numeric(nrow(tests))
+    for (t in unique(typ)) {
+      w <- which(typ == t); M <- Bl[[t]]$M; cm <- colMeans(M); cs <- pmax(colSums(M^2) - nrow(M) * cm^2, 0)
+      m[w] <- cm[col[w]]; ss[w] <- cs[col[w]]
+    }
+    list(mean = m, ss = ss)
+  }
+  Lst <- bst(Lb, tests$A, tests$lc); Rst <- bst(Rb, tests$Bt, tests$rc)
+  cr <- which(tests$p == nrow(tab) + 1L); crow <- cr[match(paste(tests$A, tests$Bt), paste(tests$A[cr], tests$Bt[cr]))]
   res <- list()
   for (s in setdiff(scales, "expression")) {
     t1 <- proc.time()[[3]]
     S <- if (s == "contact") .scores_contact(ctx, k)
          else .scores_grid(ctx, if (s == "paracrine") sigma_p else sigma_n, if (s == "paracrine") bin_p else bin_n,
                            chunk, grid_mem, z_cand)
-    res[[s]] <- .summarise(S$S, S$V, tests, s)
-    tm[s] <- proc.time()[[3]] - t1; say("%s done", s)
+    res[[s]] <- cbind(.summarise(S$S, S$V, tests, s), .beyond_type(S$S, S$V, crow, Lst$mean * Rst$mean),
+                      .within_shuffle(S$S[, 1], tests, .within_graph(ctx, s, k, if (s == "paracrine") sigma_p else sigma_n,
+                                                                      if (s == "paracrine") bin_p else bin_n), K, nt, Lst, Rst))
+    tm[s] <- proc.time()[[3]] - t1; say("%s done", s); rm(S); invisible(gc(FALSE))
   }
   if ("expression" %in% scales) res$expression <- .expression_test(tests[xt, ], mLx, mRx, stL, stR, nt, n)
+  if (!is.null(res$expression)) res$expression[, c("expected_type", "z_type", "p_type", "z_shuffle", "p_shuffle")] <- NA_real_
   R <- do.call(rbind, res)
   out <- data.frame(sender = lev[R$A], receiver = lev[R$Bt], ligand = c(tab$ligand, ".cells")[R$p],
                     receptor = c(tab$receptor, ".cells")[R$p], scale = R$scale, score = R$score,
                     null_mean = R$null_mean, fold = R$score / pmax(R$null_mean, EPS), z = R$z, p = R$pv,
                     p_emp = R$p_emp, q = NA_real_, mean_L = mLx[cbind(R$A, R$li)], mean_R = mRx[cbind(R$Bt, R$ri)],
                     det_L = dL[cbind(R$A, R$li)], det_R = dR[cbind(R$Bt, R$ri)], n_sender = nt[R$A],
-                    n_receiver = nt[R$Bt], stringsAsFactors = FALSE)
+                    n_receiver = nt[R$Bt], fold_type = R$score / pmax(R$expected_type, EPS), z_type = R$z_type,
+                    p_type = R$p_type, q_type = NA_real_, z_shuffle = R$z_shuffle, p_shuffle = R$p_shuffle,
+                    q_shuffle = NA_real_, stringsAsFactors = FALSE)
   cells <- out$ligand == ".cells"
-  for (s in scales) { w <- which(out$scale == s & !cells); out$q[w] <- stats::p.adjust(out$p[w], "BH") }
+  for (s in scales) {
+    w <- which(out$scale == s & !cells); out$q[w] <- stats::p.adjust(out$p[w], "BH")
+    if (s != "expression") { out$q_type[w] <- stats::p.adjust(out$p_type[w], "BH"); out$q_shuffle[w] <- stats::p.adjust(out$p_shuffle[w], "BH") }
+  }
   for (s in scales) { w <- which(out$scale == s & cells); out$q[w] <- stats::p.adjust(out$p[w], "BH") }
   coloc <- out[cells, c("sender", "receiver", "scale", "score", "null_mean", "fold", "z", "p", "q", "n_sender",
                         "n_receiver")]
@@ -231,6 +268,65 @@ lrmap <- function(counts, coords, types, lr, lib = NULL, scales = c("contact", "
   z <- (obs - e0) / pmax(sdv, EPS); z[sdv < EPS] <- 0
   cbind(tests[, c("A", "Bt", "p", "li", "ri")], scale = "expression", score = obs, null_mean = e0, z = z,
         pv = stats::pnorm(z, lower.tail = FALSE), p_emp = NA_real_)
+}
+
+# Pair co-location beyond the co-location of the two cell types, calibrated by the shifts: D = S - mean L x mean R
+# x (type-level score of the same sender / receiver), for the observed layout and every shift. Under random
+# alignment D is near 0; a pair whose ligand-high senders sit nearer its receptor-high receivers than other cells
+# of the two types gives D > 0. Smooth spatial trends of expression enter the shifted D's spread.
+.beyond_type <- function(S, V, crow, mm) {
+  D <- S - mm * S[crow, , drop = FALSE]
+  s0 <- D[, 1]; nul <- D[, -1, drop = FALSE]; mu <- rowMeans(nul)
+  sdv <- sqrt(rowSums((nul - mu)^2) / max(ncol(nul) - 1, 1) + V)
+  z <- (s0 - mu) / pmax(sdv, EPS); z[sdv < EPS] <- 0
+  data.frame(expected_type = mm * S[crow, 1], z_type = z, p_type = stats::pnorm(z, lower.tail = FALSE))
+}
+
+# Graph sums per sender / receiver type for the within-type shuffle (observed layout). With a_ij the weight of
+# sender j in receiver i's ligand exposure (X_i = sum_j a_ij L_j): s_i = sum_j a_ij, q_i = sum_j a_ij^2,
+# c_j = sum_i a_ij. Returns K^2 x (nv, S1 = sum s, S2 = sum s^2, Q = sum q, SSc = sum (c - mean c)^2).
+.within_graph <- function(ctx, s, k, sigma, bin) {
+  coords <- ctx$coords; tcode <- ctx$tcode; K <- ctx$K; n <- nrow(coords); rng <- ctx$rng
+  keys <- unique(ctx$tests[, c("A", "Bt")])
+  out <- matrix(NA_real_, K * K, 5, dimnames = list(NULL, c("nv", "S1", "S2", "Q", "SSc")))
+  if (s == "contact") {
+    nn <- RANN::nn2(coords, k = k + 1); d0 <- stats::median(as.vector(nn$nn.dists[, -1])); rm(nn)
+    e <- .contact_edges(coords, k, d0, 3 * d0); ta <- tcode[e$send]; tb <- tcode[e$recv]
+    for (r in seq_len(nrow(keys))) {
+      A <- keys$A[r]; B <- keys$Bt[r]; w <- which(ta == A & tb == B)
+      sv <- .rsum(e$wn[w], e$recv[w], n)[rng[[B]]]; qv <- .rsum(e$wn[w]^2, e$recv[w], n)[rng[[B]]]
+      cv <- .rsum(e$wn[w], e$send[w], n)[rng[[A]]]
+      out[(A - 1) * K + B, ] <- c(sum(e$valid[rng[[B]]]), sum(sv), sum(sv^2), sum(qv), sum((cv - mean(cv))^2))
+    }
+    return(out)
+  }
+  gr <- .grid(coords, ctx$box, sigma, bin); nc <- gr$nx * gr$ny; rs <- ctx$rs
+  Tf <- .blur(.bin_sum(matrix(1, n, 1), gr$lin, nc), gr, rs)[, 1]; Tc <- Tf[gr$lin]
+  valid <- Tc >= 0.1 * stats::median(Tc); invT <- ifelse(valid, 1 / pmax(Tc, EPS), 0)
+  g2 <- gr; g2$ker <- gr$ker^2; g2$Kx@x <- g2$Kx@x^2; g2$Ky@x <- g2$Ky@x^2
+  ind <- outer(tcode, seq_len(K), "==") * 1
+  FA <- .blur(.bin_sum(ind, gr$lin, nc), gr, rs); QA <- .blur(.bin_sum(ind, gr$lin, nc), g2, rs)
+  GB <- .blur(.bin_sum(ind * invT, gr$lin, nc), gr, rs); rm(ind)
+  for (r in seq_len(nrow(keys))) {
+    A <- keys$A[r]; B <- keys$Bt[r]; rb <- rng[[B]]; lb <- gr$lin[rb]
+    sv <- FA[lb, A] * invT[rb]; qv <- QA[lb, A] * invT[rb]^2; cv <- GB[gr$lin[rng[[A]]], B]
+    out[(A - 1) * K + B, ] <- c(sum(valid[rb]), sum(sv), sum(sv^2), sum(qv), sum((cv - mean(cv))^2))
+  }
+  out
+}
+
+# Within-type shuffle: ligand values permuted among sender cells, receptor values among receiver cells, layout
+# fixed. Exact mean and variance of S = sum_i R_i X_i / nv under both permutations (normal approximation for p).
+.within_shuffle <- function(S0, tests, G, K, nt, Lst, Rst) {
+  g <- G[(tests$A - 1L) * K + tests$Bt, , drop = FALSE]; nA <- nt[tests$A]; nB <- nt[tests$Bt]; nv <- pmax(g[, "nv"], 1)
+  Lm <- Lst$mean; Lss <- Lst$ss; Rm <- Rst$mean; Rss <- Rst$ss; sL2 <- Lss / nA
+  E <- Rm * Lm * g[, "S1"] / nv
+  t1 <- Rm^2 * g[, "SSc"] * Lss / ((nA - 1) * nv^2)
+  Eu2 <- Lm^2 * g[, "S2"] + sL2 * (nA / (nA - 1) * g[, "Q"] - g[, "S2"] / (nA - 1))
+  ESu2 <- (Lm * g[, "S1"])^2 + g[, "SSc"] * Lss / (nA - 1)
+  V <- t1 + pmax(Eu2 - ESu2 / nB, 0) * Rss / ((nB - 1) * nv^2)
+  z <- (S0 - E) / sqrt(pmax(V, EPS)); z[V < EPS] <- 0
+  data.frame(z_shuffle = z, p_shuffle = stats::pnorm(z, lower.tail = FALSE))
 }
 
 # null summaries per test row: S = tests x (1 + B), first column observed; V = excess sampling variance of the
@@ -351,12 +447,27 @@ NVAR <- 21L
 #' Significant ligand-receptor co-location
 #'
 #' @param x an `LRmap` object. @param scale scales to keep.
-#' @param q_thr q-value threshold. @param min_fold minimum score over the shifted-null mean.
-#' @return rows of `x$table` with q < `q_thr` and fold >= `min_fold`, by q.
+#' @param test which null: "type" (pair co-location beyond the co-location of the two cell types, calibrated by
+#'   the shifts; `q_type`, `fold_type`), "shuffle" (ligand and receptor values shuffled within their cell
+#'   types, layout fixed; `q_shuffle`, `fold_type`) or "colocation" (shifted sender layer: co-location of
+#'   ligand-expressing senders and receptor-expressing receivers, including the co-location of the two types;
+#'   `q`, `fold`). The expression scale always uses `q` and `fold`.
+#' @param q_thr q-value threshold. @param min_fold minimum fold (see `test`).
+#' @return rows of `x$table` passing the thresholds, by q.
 #' @export
-lrmap_results <- function(x, scale = c("contact", "paracrine", "niche", "expression"), q_thr = 0.05, min_fold = 1.25) {
-  tb <- x$table; keep <- which(tb$scale %in% scale & !is.na(tb$q) & tb$q < q_thr & tb$fold >= min_fold)
+lrmap_results <- function(x, scale = c("contact", "paracrine", "niche", "expression"), test = c("type", "shuffle", "colocation"),
+                          q_thr = 0.05, min_fold = 1.25) {
+  test <- match.arg(test); tb <- x$table
+  keep <- which(tb$scale %in% scale & .called(tb, test, q_thr, min_fold))
   r <- tb[keep, ]; r[order(r$q, -r$z), ]
+}
+
+.called <- function(tb, test, q_thr, min_fold) {
+  ex <- tb$scale == "expression"
+  qq <- switch(test, type = tb$q_type, shuffle = tb$q_shuffle, colocation = tb$q)
+  ff <- if (test == "colocation") tb$fold else tb$fold_type
+  qq[ex] <- tb$q[ex]; ff[ex] <- tb$fold[ex]
+  !is.na(qq) & qq < q_thr & ff >= min_fold
 }
 
 #' @export
@@ -365,8 +476,8 @@ print.LRmap <- function(x, ...) {
               x$n_covered, x$n_pairs, x$settings$B, if (x$settings$leak) ", leak removed" else ""))
   for (s in x$settings$scales) {
     a <- x$table[x$table$scale == s, ]; cl <- x$coloc[x$coloc$scale == s, ]
-    cat(sprintf("  %-9s %6d tests, %5d co-located (q < 0.05, fold >= 1.25); type pairs co-located: %d of %d\n",
-                s, nrow(a), nrow(lrmap_results(x, s)), sum(cl$q < 0.05, na.rm = TRUE), nrow(cl)))
+    cat(sprintf("  %-10s %6d tests, %5d called (beyond type co-location, q < 0.05); type pairs co-located: %d of %d\n",
+                s, nrow(a), nrow(lrmap_results(x, s, "type")), sum(cl$q < 0.05, na.rm = TRUE), nrow(cl)))
   }
   invisible(x)
 }
@@ -378,16 +489,17 @@ print.LRmap <- function(x, ...) {
 #' co-located, and whether the two cell types co-locate at all (`coloc`).
 #'
 #' @param x an `LRmap` object fitted with `scales` including "expression".
-#' @param q_thr,min_fold call thresholds (as in [lrmap_results()]).
+#' @param test,q_thr,min_fold call rule for the spatial scales (as in [lrmap_results()]).
 #' @return data.frame: sender, receiver, ligand, receptor, `expr_call`, `expr_z`, `spatial_scales` (called
 #'   scales joined by "+", "" if none), `spatial_call`, `types_colocated`, and `class`: "both",
 #'   "expression only", "spatial only" or "neither".
 #' @export
-lrmap_compare <- function(x, q_thr = 0.05, min_fold = 1.25) {
+lrmap_compare <- function(x, test = c("type", "shuffle", "colocation"), q_thr = 0.05, min_fold = 1.25) {
+  test <- match.arg(test)
   tb <- x$table; sp <- setdiff(x$settings$scales, "expression")
   if (!"expression" %in% x$settings$scales || !length(sp)) stop("x needs the 'expression' scale and a spatial scale")
   key <- function(d) paste(d$sender, d$receiver, d$ligand, d$receptor, sep = "\r")
-  call <- !is.na(tb$q) & tb$q < q_thr & tb$fold >= min_fold
+  call <- .called(tb, test, q_thr, min_fold)
   ex <- tb[tb$scale == "expression", ]; k <- key(ex)
   out <- data.frame(ex[, c("sender", "receiver", "ligand", "receptor")], expr_call = call[tb$scale == "expression"],
                     expr_z = ex$z, stringsAsFactors = FALSE)

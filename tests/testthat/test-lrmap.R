@@ -138,3 +138,11 @@ test_that("min_shift shorter than the widest kernel reach warns", {
   expect_no_warning(lrmap::lrmap(s$counts, s$coords, s$types, s$lr, lib = s$lib, B = 5, min_shift = 200,
                                  scales = c("contact", "paracrine"), verbose = FALSE))
 })
+
+test_that("a cell type with a single cell does not break leak removal or the expression scale", {
+  s <- lrmap_simulate("touch", size = 600, n_clusters = 4, leak = 0.05, seed = 9)
+  s$types[1] <- "E"; s$lr <- rbind(s$lr[, 1:2], data.frame(ligand = "L", receptor = "G1_G2"))
+  s$lr$receptor_subunits <- ifelse(s$lr$receptor == "G1_G2", "G1_G2", s$lr$receptor)
+  expect_no_error(lrmap(s$counts, s$coords, s$types, s$lr, lib = s$lib, B = 5, min_shift = 150, leak = s$leak,
+                        scales = c("contact", "expression"), verbose = FALSE))
+})
