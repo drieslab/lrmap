@@ -39,7 +39,7 @@ EPS <- 1e-12
 
 # Grid for a Gaussian scale: bin index per cell and a banded blur operator (zero padded, no wrap)
 .grid <- function(coords, box, sigma, bin) {
-  nx <- ceiling(box[2] / bin); ny <- ceiling(box[4] / bin)
+  nx <- max(1, ceiling(box[2] / bin)); ny <- max(1, ceiling(box[4] / bin))
   gx <- pmin(floor((coords[, 1] - box[1]) / bin), nx - 1); gy <- pmin(floor((coords[, 2] - box[3]) / bin), ny - 1)
   band <- function(m) {
     r <- ceiling(3 * sigma / bin); off <- (-r):r; ker <- exp(-0.5 * (off * bin)^2 / sigma^2)
@@ -49,13 +49,12 @@ EPS <- 1e-12
   list(nx = nx, ny = ny, gx = gx, gy = gy, lin = gx + gy * nx + 1, Kx = band(nx), Ky = band(ny), bin = bin)
 }
 
-# Blur several grids at once. V: (nx * ny) x m (column-major nx x ny per column) -> same shape.
+# Blur several grids at once. V: (nx * ny) x m (column-major nx x ny per column) -> same shape. Rows (x) by
+# the band operator on the left, columns (y) by a block-diagonal band on the right: no transposes.
 .blur <- function(V, gr) {
-  m <- ncol(V); nx <- gr$nx; ny <- gr$ny
-  A <- as.matrix(gr$Kx %*% matrix(V, nx))                                  # rows: nx x (ny * m)
-  A <- aperm(array(A, c(nx, ny, m)), c(2, 1, 3))                           # ny x nx x m
-  A <- as.matrix(gr$Ky %*% matrix(A, ny))
-  matrix(aperm(array(A, c(ny, nx, m)), c(2, 1, 3)), nx * ny)
+  m <- ncol(V); A <- gr$Kx %*% matrix(V, gr$nx)                            # nx x (ny * m)
+  A <- A %*% if (m == 1) gr$Ky else Matrix::bdiag(rep(list(gr$Ky), m))      # Ky symmetric
+  matrix(as.matrix(A), gr$nx * gr$ny)
 }
 
 # Sum values into grid bins: x is cells x m (cells subset `idx`), returns (nx*ny) x m
@@ -64,10 +63,3 @@ EPS <- 1e-12
   out[as.integer(rownames(r)), ] <- r; out
 }
 
-# linear grid index at which each receiver reads the sender layer shifted by `shift` (microns): the sender
-# field at x - shift, wrapped in the box exactly as the contact scale wraps sender cells
-.shift_lin <- function(gr, shift, coords, box) {
-  m <- .shift_coords(coords, -shift, box)
-  gx <- pmin(floor((m[, 1] - box[1]) / gr$bin), gr$nx - 1); gy <- pmin(floor((m[, 2] - box[3]) / gr$bin), gr$ny - 1)
-  gx + gy * gr$nx + 1
-}

@@ -12,19 +12,23 @@
   out <- data.frame(ligand = as.character(lr$ligand), receptor = as.character(lr$receptor), stringsAsFactors = FALSE)
   out$lg <- sub("ligand_subunits", "ligand"); out$rg <- sub("receptor_subunits", "receptor")
   out <- out[!duplicated(paste(out$ligand, out$receptor)), , drop = FALSE]
+  all_g <- unique(unlist(c(out$lg, out$rg)))
+  if (is.null(genes)) return(list(genes = all_g))
   ok <- vapply(seq_len(nrow(out)), function(i) all(c(out$lg[[i]], out$rg[[i]]) %in% genes), TRUE)
-  list(table = out[ok, , drop = FALSE], n = nrow(out), n_covered = sum(ok))
+  list(table = out[ok, , drop = FALSE], n = nrow(out), n_covered = sum(ok), genes = all_g)
 }
 
-# Entity matrices (cells x entities): ligand = minimum over subunits, receptor = mean over subunits.
-# Y: cells x genes (composition scale, possibly leak-corrected); D: cells x genes detection (0/1).
-.entities <- function(names, subunits, Y, D, fun) {
-  u <- !duplicated(names); names <- names[u]; subunits <- subunits[u]
-  E <- vapply(subunits, function(g) {
-    M <- Y[, g, drop = FALSE]
-    if (ncol(M) == 1) M[, 1] else if (fun == "min") do.call(pmin, as.data.frame(M)) else rowMeans(M)
-  }, numeric(nrow(Y)))
-  Dt <- vapply(subunits, function(g) do.call(pmin, as.data.frame(D[, g, drop = FALSE])), numeric(nrow(Y)))
-  E <- matrix(E, nrow(Y)); Dt <- matrix(Dt, nrow(Y)); colnames(E) <- colnames(Dt) <- names
-  list(E = E, D = Dt)
+# Entity matrices (sparse, cells x entities) from composition-scale Y (sparse cells x genes): ligand = minimum
+# over subunits, receptor = mean. D: all subunits detected. k: number of subunits.
+.entities_sparse <- function(names, subunits, Y, fun) {
+  u <- !duplicated(names); names <- names[u]; subunits <- subunits[u]; n <- nrow(Y)
+  cols <- lapply(subunits, function(g) {
+    if (length(g) == 1) return(list(e = Y[, g, drop = FALSE], d = methods::as((Y[, g, drop = FALSE] > 0) * 1, "CsparseMatrix")))
+    M <- as.matrix(Y[, g, drop = FALSE])
+    v <- if (fun == "min") do.call(pmin, as.data.frame(M)) else rowMeans(M)
+    list(e = Matrix::Matrix(v, n, 1, sparse = TRUE), d = Matrix::Matrix((rowSums(M > 0) == length(g)) * 1, n, 1, sparse = TRUE))
+  })
+  E <- do.call(cbind, lapply(cols, `[[`, "e")); D <- do.call(cbind, lapply(cols, `[[`, "d"))
+  colnames(E) <- colnames(D) <- names
+  list(E = methods::as(E, "CsparseMatrix"), D = methods::as(D, "CsparseMatrix"), k = lengths(subunits))
 }

@@ -19,17 +19,19 @@
 #' reported separately so pair-level results can be read against it. Giotto's original cell-cell
 #' communication test (`spatCellCellcom`) is the contact-only predecessor of this analysis.
 #'
-#' @param counts genes x cells count matrix (dense or sparse) with gene rownames. Only the genes of `lr` are read.
+#' @param counts raw counts: a genes x cells matrix (dense or sparse) with gene rownames, or a reader
+#'   `function(genes)` returning a genes x cells matrix for the requested genes that exist (rows named; cells in
+#'   the order of `coords`), e.g. reading from a disk-backed store. Only the genes of `lr` are read, once.
 #' @param coords cells x 2 coordinates (microns).
 #' @param types cell type per cell.
 #' @param lr ligand-receptor table: columns `ligand` and `receptor`, optionally `ligand_subunits` and
 #'   `receptor_subunits` (subunit genes joined by `"_"`). A complex ligand is the minimum over its subunits,
 #'   a complex receptor the mean.
-#' @param lib library size per cell (default: column sums of `counts`, which is only right if `counts` holds
-#'   all genes).
+#' @param lib library size per cell (all genes). Default: column sums of `counts` when it is a matrix holding all
+#'   genes; required with a reader.
 #' @param scales any of "contact", "paracrine", "niche".
 #' @param k contact neighbours. @param sigma_p,sigma_n paracrine and niche kernel widths (microns).
-#' @param bin_p,bin_n grid bins for paracrine and niche (microns).
+#' @param bin_p,bin_n grid bins for paracrine and niche (microns); keep at most a third of the kernel width.
 #' @param B number of toroidal shifts. @param min_shift minimum shift length (microns).
 #' @param min_det a pair is tested for (A, B) when the ligand is detected in at least `min_det` of A cells and
 #'   the receptor (every subunit) in at least `min_det` of B cells.
@@ -38,44 +40,67 @@
 #' @param leak optional leak coefficients: an `EdgeICG` fit or a data.frame with `receiver`, `sender`
 #'   (type names), `lambda` and optionally `mu`. Transcripts leaked from touching cells of other types are then
 #'   removed from every cell before scoring.
-#' @param chunk ligands blurred at a time (memory: grid bins x chunk numbers).
+#' @param chunk ligands blurred at a time; default from the grid size (about `grid_mem` numbers per chunk).
+#' @param grid_mem numbers held per blurred chunk (sets the default `chunk`).
+#' @param z_cand the ligand-side part of the sampling variance on grid scales is computed for tests with z above
+#'   this before it (adding variance only lowers z).
 #' @param seed seed for the shifts. @param verbose progress messages.
 #' @return an `LRmap` object: `table` (one row per tested sender, receiver, pair and scale), `coloc`
 #'   (type-level co-location per scale), `n_pairs`, `n_covered`, `settings`, `timing`.
 #' @export
 lrmap <- function(counts, coords, types, lr, lib = NULL, scales = c("contact", "paracrine", "niche"), k = 8,
-                  sigma_p = 25, sigma_n = 150, bin_p = 5, bin_n = 10, B = 200L, min_shift = 450, min_det = 0.05,
-                  min_cells = 30L, same_type = FALSE, leak = NULL, chunk = 64L, seed = 1L, verbose = TRUE) {
+                  sigma_p = 25, sigma_n = 150, bin_p = 8, bin_n = 25, B = 200L, min_shift = 450, min_det = 0.05,
+                  min_cells = 30L, same_type = FALSE, leak = NULL, chunk = NULL, grid_mem = 4e7, z_cand = 1.5,
+                  seed = 1L, verbose = TRUE) {
   t0 <- proc.time()[[3]]; tm <- c()
   say <- function(...) if (verbose) message(sprintf("[lrmap %5.0f s] ", proc.time()[[3]] - t0), sprintf(...))
   scales <- match.arg(scales, c("contact", "paracrine", "niche"), several.ok = TRUE)
   coords <- as.matrix(coords)[, 1:2, drop = FALSE]; n <- nrow(coords)
-  if (ncol(counts) != n || length(types) != n) stop("counts, coords and types must describe the same cells")
-  types <- as.character(types); lev <- sort(unique(types)); tcode <- match(types, lev); K <- length(lev)
-  if (is.null(lib)) lib <- Matrix::colSums(counts)
-  tb <- .lr_table(lr, rownames(counts)); tab <- tb$table
-  if (!nrow(tab)) stop("no ligand-receptor pair has all its genes in counts")
-  genes <- unique(unlist(c(tab$lg, tab$rg)))
-  X <- t(as.matrix(counts[genes, , drop = FALSE])); D <- (X > 0) * 1
-  Y <- X * (100 / pmax(lib, 1)); rm(X)
-  # per-cell sampling variance: Poisson (y * 100 / lib on the composition scale) plus, with leak removal, the
-  # variance of the subtracted leak estimate
-  Vc <- pmax(Y, 0) * (100 / pmax(lib, 1))
-  if (!is.null(leak)) { ul <- .unleak(Y, tcode, K, coords, k, .leak_mats(leak, lev), lib); Y <- ul$Y; Vc <- Vc + ul$V; rm(ul) }
-  VL <- cbind(.entity_var(tab$ligand, tab$lg, Y, Vc, "min"), .cells = 0)
-  VR <- cbind(.entity_var(tab$receptor, tab$rg, Y, Vc, "mean"), .cells = 0); rm(Vc)
-  Le <- .entities(tab$ligand, tab$lg, Y, D, "min"); Re <- .entities(tab$receptor, tab$rg, Y, D, "mean")
-  rm(Y, D)
-  Lm <- cbind(Le$E, .cells = 1); Rm <- cbind(Re$E, .cells = 1)
-  nt <- tabulate(tcode, K)
-  detL <- rowsum(cbind(Le$D, .cells = 1), tcode) / nt; detR <- rowsum(cbind(Re$D, .cells = 1), tcode) / nt
-  mL <- rowsum(Lm, tcode) / nt; mR <- rowsum(Rm, tcode) / nt
+  if (length(types) != n) stop("coords and types must describe the same cells")
+  types <- as.character(types); lev <- sort(unique(types)); K <- length(lev)
+  # cells sorted by type: every type is a contiguous block
+  ord <- order(match(types, lev)); tcode <- match(types, lev)[ord]; coords <- coords[ord, , drop = FALSE]
+  nt <- tabulate(tcode, K); off <- c(0L, cumsum(nt))[seq_len(K)]
+  rng <- lapply(seq_len(K), function(t) off[t] + seq_len(nt[t]))
 
-  # tests: every (sender A, receiver B, pair) passing the expression filters, plus the type-level rows (.cells)
-  li <- c(match(tab$ligand, colnames(Lm)), ncol(Lm)); ri <- c(match(tab$receptor, colnames(Rm)), ncol(Rm))
-  ok_t <- nt >= min_cells
+  # read the table's genes once (sparse genes x cells)
+  tg <- .lr_table(lr, NULL)$genes
+  Xg <- if (is.function(counts)) counts(tg) else counts[intersect(tg, rownames(counts)), , drop = FALSE]
+  if (ncol(Xg) != n) stop("counts must have one column per cell")
+  if (is.null(lib)) {
+    if (is.function(counts)) stop("lib is required when counts is a reader function")
+    lib <- Matrix::colSums(counts)
+  }
+  lib <- pmax(as.numeric(lib)[ord], 1)
+  Xg <- methods::as(Xg, "CsparseMatrix")[, ord, drop = FALSE]
+  tb <- .lr_table(lr, rownames(Xg)); tab <- tb$table
+  if (!nrow(tab)) stop("no ligand-receptor pair has all its genes in counts")
+  Y <- Matrix::Diagonal(x = 100 / lib) %*% Matrix::t(Xg[unique(unlist(c(tab$lg, tab$rg))), , drop = FALSE])
+  rm(Xg)
+  Le <- .entities_sparse(tab$ligand, tab$lg, Y, "min"); Re <- .entities_sparse(tab$receptor, tab$rg, Y, "mean")
+  rm(Y)
+  # sampling variance per cell: Poisson on the composition scale (y * 100 / lib; mean of k subunits: / k)
+  pv <- 100 / lib
+  VL <- Matrix::Diagonal(x = pv) %*% Le$E; VR <- Matrix::Diagonal(x = pv) %*% Re$E %*% Matrix::Diagonal(x = 1 / Re$k)
+  Ty <- Matrix::sparseMatrix(i = tcode, j = seq_len(n), x = 1, dims = c(K, n))
+  aL <- as.matrix(Ty %*% Le$E) / nt; aR <- as.matrix(Ty %*% Re$E) / nt               # type means (before leak removal)
+  cmu <- numeric(n); Lc <- Le$E; Rc <- Re$E
+  if (!is.null(leak)) {   # leak removal (entity level): x - W x - cmu * type mean; variance of W x added
+    lw <- .leak_W(coords, tcode, k, .leak_mats(leak, lev)); cmu <- lw$cmu
+    Lc <- Le$E - lw$W %*% Le$E; Rc <- Re$E - lw$W %*% Re$E
+    VL <- VL + lw$W2 %*% VL; VR <- VR + lw$W2 %*% VR; rm(lw)
+  }
+  detL <- as.matrix(Ty %*% Le$D) / nt; detR <- as.matrix(Ty %*% Re$D) / nt
+  cm <- as.vector(Ty %*% cmu) / nt
+  mL <- as.matrix(Ty %*% Lc) / nt - cm * aL; mR <- as.matrix(Ty %*% Rc) / nt - cm * aR
+  nl <- ncol(Lc); nr <- ncol(Rc)
+
+  # tests: every (sender A, receiver B, pair) passing the expression filters, plus the type-level rows (.cells,
+  # entity index nl + 1 / nr + 1)
+  li <- c(match(tab$ligand, colnames(Lc)), nl + 1L); ri <- c(match(tab$receptor, colnames(Rc)), nr + 1L)
+  dL <- cbind(detL, 1); dR <- cbind(detR, 1); ok_t <- nt >= min_cells
   tests <- do.call(rbind, lapply(seq_along(li), function(p) {
-    g <- expand.grid(A = which(ok_t & detL[, li[p]] >= min_det), Bt = which(ok_t & detR[, ri[p]] >= min_det))
+    g <- expand.grid(A = which(ok_t & dL[, li[p]] >= min_det), Bt = which(ok_t & dR[, ri[p]] >= min_det))
     if (!same_type) g <- g[g$A != g$Bt, , drop = FALSE]
     if (nrow(g)) cbind(g, p = p) else NULL
   }))
@@ -83,23 +108,47 @@ lrmap <- function(counts, coords, types, lr, lib = NULL, scales = c("contact", "
   say("%d of %d pairs covered; %d sender-receiver-pair tests per scale", tb$n_covered, tb$n,
       sum(tests$p <= nrow(tab)))
 
+  # dense blocks: per type, only the entities it is tested with (corrected values and their variances)
+  blk <- function(E, V, a, idx, side) {
+    lapply(seq_len(K), function(t) {
+      cols <- sort(unique(idx[tests[[side]] == t])); if (!length(cols)) return(NULL)
+      ent <- cols[cols <= ncol(E)]; r <- rng[[t]]
+      M <- matrix(1, length(r), length(cols)); Vv <- matrix(0, length(r), length(cols))
+      if (length(ent)) {
+        w <- match(ent, cols)
+        M[, w] <- as.matrix(E[r, ent, drop = FALSE]) - outer(cmu[r], a[t, ent])
+        Vv[, w] <- as.matrix(V[r, ent, drop = FALSE])
+      }
+      list(M = M, V = Vv, cols = cols)
+    })
+  }
+  Lb <- blk(Lc, VL, aL, tests$li, "A"); Rb <- blk(Rc, VR, aR, tests$ri, "Bt")
+  tests$lc <- vapply(seq_len(nrow(tests)), function(i) match(tests$li[i], Lb[[tests$A[i]]]$cols), 1L)
+  tests$rc <- vapply(seq_len(nrow(tests)), function(i) match(tests$ri[i], Rb[[tests$Bt[i]]]$cols), 1L)
+  rm(Lc, Rc, VL, VR, Le, Re)
+  say("blocks: %.0f MB", (sum(vapply(Lb, function(b) if (is.null(b)) 0 else length(b$M), 1)) +
+                            sum(vapply(Rb, function(b) if (is.null(b)) 0 else length(b$M), 1))) * 16 / 2^20)
+
   box <- c(min(coords[, 1]), diff(range(coords[, 1])) + 1e-6, min(coords[, 2]), diff(range(coords[, 2])) + 1e-6)
   sh <- .shifts(B, box, min_shift, seed)
+  ctx <- list(coords = coords, tcode = tcode, K = K, off = off, rng = rng, Lb = Lb, Rb = Rb, tests = tests,
+              sh = sh, box = box)
   res <- list()
   for (s in scales) {
     t1 <- proc.time()[[3]]
-    S <- if (s == "contact") .scores_contact(coords, tcode, K, Lm, Rm, tests, sh, box, k, VL, VR)
-         else .scores_grid(coords, tcode, K, Lm, Rm, tests, sh, box, if (s == "paracrine") sigma_p else sigma_n,
-                           if (s == "paracrine") bin_p else bin_n, chunk, VL, VR)
+    S <- if (s == "contact") .scores_contact(ctx, k)
+         else .scores_grid(ctx, if (s == "paracrine") sigma_p else sigma_n, if (s == "paracrine") bin_p else bin_n,
+                           chunk, grid_mem, z_cand)
     res[[s]] <- .summarise(S$S, S$V, tests, s)
     tm[s] <- proc.time()[[3]] - t1; say("%s done", s)
   }
   R <- do.call(rbind, res)
+  mLx <- cbind(mL, 1); mRx <- cbind(mR, 1)
   out <- data.frame(sender = lev[R$A], receiver = lev[R$Bt], ligand = c(tab$ligand, ".cells")[R$p],
                     receptor = c(tab$receptor, ".cells")[R$p], scale = R$scale, score = R$score,
                     null_mean = R$null_mean, fold = R$score / pmax(R$null_mean, EPS), z = R$z, p = R$pv,
-                    p_emp = R$p_emp, q = NA_real_, mean_L = mL[cbind(R$A, R$li)], mean_R = mR[cbind(R$Bt, R$ri)],
-                    det_L = detL[cbind(R$A, R$li)], det_R = detR[cbind(R$Bt, R$ri)], n_sender = nt[R$A],
+                    p_emp = R$p_emp, q = NA_real_, mean_L = mLx[cbind(R$A, R$li)], mean_R = mRx[cbind(R$Bt, R$ri)],
+                    det_L = dL[cbind(R$A, R$li)], det_R = dR[cbind(R$Bt, R$ri)], n_sender = nt[R$A],
                     n_receiver = nt[R$Bt], stringsAsFactors = FALSE)
   cells <- out$ligand == ".cells"
   for (s in scales) { w <- which(out$scale == s & !cells); out$q[w] <- stats::p.adjust(out$p[w], "BH") }
@@ -122,81 +171,90 @@ lrmap <- function(counts, coords, types, lr, lib = NULL, scales = c("contact", "
   s0 <- S[, 1]; nul <- S[, -1, drop = FALSE]; B <- ncol(nul)
   mu <- rowMeans(nul); sdv <- sqrt(rowSums((nul - mu)^2) / (B - 1) + V)
   z <- (s0 - mu) / pmax(sdv, EPS); z[sdv < EPS & abs(s0 - mu) < EPS] <- 0
-  cbind(tests, scale = s, score = s0, null_mean = mu, z = z, pv = stats::pnorm(z, lower.tail = FALSE),
-        p_emp = (1 + rowSums(nul >= s0)) / (B + 1))
-}
-
-# contact: k nearest cells of the (shifted) sender layer per receiver
-.scores_contact <- function(coords, tcode, K, Lm, Rm, tests, sh, box, k, VL = NULL, VR = NULL) {
-  nn <- RANN::nn2(coords, k = k + 1); d <- as.vector(nn$nn.dists[, -1]); d0 <- stats::median(d)
-  cap <- 3 * d0
-  blk <- split(seq_len(nrow(tests)), (tests$A - 1L) * K + tests$Bt)
-  S <- matrix(0, nrow(tests), nrow(sh)); nvar <- min(NVAR, nrow(sh)); Vs <- matrix(0, nrow(tests), nvar)
-  for (v in seq_len(nrow(sh))) {
-    e <- .contact_edges(coords, k, d0, cap, if (v == 1) NULL else sh[v, ], box)
-    nv <- tabulate(tcode[e$valid], K)
-    key <- (tcode[e$send] - 1L) * K + tcode[e$recv]
-    eb <- split(seq_along(key), key)
-    for (b in names(blk)) {
-      rows <- blk[[b]]; ee <- eb[[b]]; if (is.null(ee)) next
-      Bt <- tests$Bt[rows[1]]
-      Rr <- Rm[e$recv[ee], tests$ri[rows], drop = FALSE]; Ls <- Lm[e$send[ee], tests$li[rows], drop = FALSE]
-      S[rows, v] <- colSums(e$wn[ee] * Rr * Ls) / max(nv[Bt], 1)
-      if (v <= nvar) {                         # sampling variance: score = sum_i R_i X_i, X_i = sum_j wn_ij L_j
-        XR <- rowsum(e$wn[ee] * Ls, e$recv[ee]); ir <- as.integer(rownames(XR))
-        CL <- rowsum(e$wn[ee] * Rr, e$send[ee]); js <- as.integer(rownames(CL))
-        Vs[rows, v] <- (colSums(XR^2 * VR[ir, tests$ri[rows], drop = FALSE]) +
-                          colSums(CL^2 * VL[js, tests$li[rows], drop = FALSE])) / max(nv[Bt], 1)^2
-      }
-    }
-  }
-  list(S = S, V = .excess(Vs))
+  cbind(tests[, c("A", "Bt", "p", "li", "ri")], scale = s, score = s0, null_mean = mu, z = z,
+        pv = stats::pnorm(z, lower.tail = FALSE), p_emp = (1 + rowSums(nul >= s0)) / (B + 1))
 }
 
 # excess of the observed alignment's sampling variance over the mean of the shifted ones
 .excess <- function(Vs) pmax(Vs[, 1] - rowMeans(Vs[, -1, drop = FALSE]), 0)
 NVAR <- 21L
 
-# paracrine / niche: blurred ligand fields of each sender type, read at receivers (shifted sender layer)
-.scores_grid <- function(coords, tcode, K, Lm, Rm, tests, sh, box, sigma, bin, chunk, VL = NULL, VR = NULL) {
-  gr <- .grid(coords, box, sigma, bin); nc <- gr$nx * gr$ny
-  Tf <- .blur(.bin_sum(matrix(1, nrow(coords), 1), gr$lin, nc), gr)[, 1]
+# contact: k nearest cells of the (shifted) sender layer per receiver; score = sum_i R_i sum_j wn_ij L_j / n_B
+.scores_contact <- function(ctx, k) {
+  coords <- ctx$coords; tcode <- ctx$tcode; K <- ctx$K; tests <- ctx$tests; sh <- ctx$sh
+  nn <- RANN::nn2(coords, k = k + 1); d0 <- stats::median(as.vector(nn$nn.dists[, -1])); cap <- 3 * d0; rm(nn)
+  bl <- split(seq_len(nrow(tests)), (tests$A - 1L) * K + tests$Bt)
+  nvar <- min(NVAR, nrow(sh)); S <- matrix(0, nrow(tests), nrow(sh)); Vs <- matrix(0, nrow(tests), nvar)
+  for (v in seq_len(nrow(sh))) {
+    e <- .contact_edges(coords, k, d0, cap, if (v == 1) NULL else sh[v, ], ctx$box)
+    nv <- tabulate(tcode[e$valid], K)
+    key <- (tcode[e$send] - 1L) * K + tcode[e$recv]
+    eb <- split(seq_along(key), key)
+    for (b in names(bl)) {
+      rows <- bl[[b]]; ee <- eb[[b]]; if (is.null(ee)) next
+      A <- tests$A[rows[1]]; Bt <- tests$Bt[rows[1]]; LB <- ctx$Lb[[A]]; RB <- ctx$Rb[[Bt]]
+      ir <- e$recv[ee] - ctx$off[Bt]; js <- e$send[ee] - ctx$off[A]
+      Rr <- RB$M[ir, tests$rc[rows], drop = FALSE]; Ls <- LB$M[js, tests$lc[rows], drop = FALSE]
+      S[rows, v] <- colSums(e$wn[ee] * Rr * Ls) / max(nv[Bt], 1)
+      if (v <= nvar) {                         # sampling variance: score = sum_i R_i X_i, X_i = sum_j wn_ij L_j
+        XR <- rowsum(e$wn[ee] * Ls, ir); CL <- rowsum(e$wn[ee] * Rr, js)
+        Vs[rows, v] <- (colSums(XR^2 * RB$V[as.integer(rownames(XR)), tests$rc[rows], drop = FALSE]) +
+                          colSums(CL^2 * LB$V[as.integer(rownames(CL)), tests$lc[rows], drop = FALSE])) / max(nv[Bt], 1)^2
+      }
+    }
+  }
+  list(S = S, V = .excess(Vs))
+}
+
+# paracrine / niche: blurred ligand fields of each sender type, read at receivers (sender layer shifted by whole
+# bins, wrapped with the grid's period)
+.scores_grid <- function(ctx, sigma, bin, chunk, grid_mem, z_cand) {
+  coords <- ctx$coords; tcode <- ctx$tcode; K <- ctx$K; tests <- ctx$tests; sh <- ctx$sh; n <- nrow(coords)
+  gr <- .grid(coords, ctx$box, sigma, bin); nc <- gr$nx * gr$ny
+  if (is.null(chunk)) chunk <- max(1L, min(64L, floor(grid_mem / nc)))
+  sxy <- cbind(round(sh[, 1] / bin), round(sh[, 2] / bin))
+  linv <- function(idx, v) ((gr$gx[idx] - sxy[v, 1]) %% gr$nx) + ((gr$gy[idx] - sxy[v, 2]) %% gr$ny) * gr$nx + 1
+  Tf <- .blur(.bin_sum(matrix(1, n, 1), gr$lin, nc), gr)[, 1]
   tau <- 0.1 * stats::median(Tf[gr$lin])
-  LV <- vapply(seq_len(nrow(sh)), function(v) .shift_lin(gr, sh[v, ], coords, box), numeric(nrow(coords)))
-  VA <- matrix(Tf[LV] >= tau, nrow(coords))                                   # valid receivers per shift
-  nv <- rowsum(VA * 1, tcode)                                                  # K x shifts (types present)
-  nvK <- matrix(0, K, nrow(sh)); nvK[as.integer(rownames(nv)), ] <- nv
-  S <- matrix(0, nrow(tests), nrow(sh)); nvar <- min(NVAR, nrow(sh)); Vs <- matrix(0, nrow(tests), nvar)
+  nvK <- vapply(seq_len(nrow(sh)), function(v) tabulate(tcode[Tf[linv(seq_len(n), v)] >= tau], K), numeric(K))
+  nvK <- matrix(nvK, K)
+  nvar <- min(NVAR, nrow(sh)); S <- matrix(0, nrow(tests), nrow(sh)); Vs <- matrix(0, nrow(tests), nvar)
   for (A in unique(tests$A)) {
-    ta <- which(tests$A == A); la <- unique(tests$li[ta]); sa <- which(tcode == A)
+    ta <- which(tests$A == A); la <- unique(tests$lc[ta]); sa <- ctx$rng[[A]]; LB <- ctx$Lb[[A]]
     for (ch in split(la, ceiling(seq_along(la) / chunk))) {
-      Fq <- .blur(.bin_sum(Lm[sa, ch, drop = FALSE], gr$lin[sa], nc), gr) / pmax(Tf, EPS)
+      Fq <- .blur(.bin_sum(LB$M[, ch, drop = FALSE], gr$lin[sa], nc), gr) / pmax(Tf, EPS)
       Fq[Tf < tau, ] <- 0
-      rows_c <- ta[tests$li[ta] %in% ch]
+      rows_c <- ta[tests$lc[ta] %in% ch]
       for (Bt in unique(tests$Bt[rows_c])) {
-        rows <- rows_c[tests$Bt[rows_c] == Bt]; cb <- which(tcode == Bt)
-        RB <- Rm[cb, tests$ri[rows], drop = FALSE]; lp <- match(tests$li[rows], ch)
-        VRB <- VR[cb, tests$ri[rows], drop = FALSE]
+        rows <- rows_c[tests$Bt[rows_c] == Bt]; cb <- ctx$rng[[Bt]]; RB <- ctx$Rb[[Bt]]
+        Rm <- RB$M[, tests$rc[rows], drop = FALSE]; VRB <- RB$V[, tests$rc[rows], drop = FALSE]
+        lp <- match(tests$lc[rows], ch)
         for (v in seq_len(nrow(sh))) {
-          Xv <- Fq[LV[cb, v], lp, drop = FALSE] * VA[cb, v]
-          S[rows, v] <- colSums(RB * Xv) / max(nvK[Bt, v], 1)
+          lin <- linv(cb, v)
+          Xv <- Fq[lin, lp, drop = FALSE]                                    # 0 where invalid (Tf < tau)
+          S[rows, v] <- colSums(Rm * Xv) / max(nvK[Bt, v], 1)
           if (v <= nvar) Vs[rows, v] <- Vs[rows, v] + colSums(Xv^2 * VRB) / max(nvK[Bt, v], 1)^2   # receptor side
         }
       }
     }
   }
-  # ligand side: dS/dL_j = sum_i R_i K(x_i, x_j + shift) / T_i, a blurred R / T field read at the shifted sender
-  for (Bt in unique(tests$Bt)) {
-    tb <- which(tests$Bt == Bt); rb <- unique(tests$ri[tb])
+  # ligand side: dS/dL_j = sum_i R_i K(x_i - shift, x_j) / T(x_i - shift): a blurred R / T field read at senders.
+  # Added variance only lowers z, so it is computed for candidate tests (z before it > z_cand) only.
+  nul <- S[, -1, drop = FALSE]; mu <- rowMeans(nul)
+  sdv <- sqrt(rowSums((nul - mu)^2) / max(ncol(nul) - 1, 1) + .excess(Vs))
+  cand <- which((S[, 1] - mu) / pmax(sdv, EPS) > z_cand)
+  for (Bt in unique(tests$Bt[cand])) {
+    tb <- cand[tests$Bt[cand] == Bt]; rb <- unique(tests$rc[tb]); cb <- ctx$rng[[Bt]]; RB <- ctx$Rb[[Bt]]
     for (v in seq_len(nvar)) {
-      cb <- which(tcode == Bt & VA[, v]); if (!length(cb)) next
+      lin <- linv(cb, v); ok <- Tf[lin] >= tau; if (!any(ok)) next
       for (ch in split(rb, ceiling(seq_along(rb) / chunk))) {
-        G <- .blur(.bin_sum(Rm[cb, ch, drop = FALSE] / pmax(Tf[LV[cb, v]], EPS), LV[cb, v], nc), gr)
-        rows_c <- tb[tests$ri[tb] %in% ch]
+        G <- .blur(.bin_sum(RB$M[ok, ch, drop = FALSE] / Tf[lin[ok]], lin[ok], nc), gr)
+        rows_c <- tb[tests$rc[tb] %in% ch]
         for (A in unique(tests$A[rows_c])) {
-          rows <- rows_c[tests$A[rows_c] == A]; sa <- which(tcode == A)
-          Cj <- G[gr$lin[sa], match(tests$ri[rows], ch), drop = FALSE]
-          Vs[rows, v] <- Vs[rows, v] + colSums(Cj^2 * VL[sa, tests$li[rows], drop = FALSE]) / max(nvK[Bt, v], 1)^2
+          rows <- rows_c[tests$A[rows_c] == A]; sa <- ctx$rng[[A]]
+          Cj <- G[gr$lin[sa], match(tests$rc[rows], ch), drop = FALSE]
+          Vs[rows, v] <- Vs[rows, v] + colSums(Cj^2 * ctx$Lb[[A]]$V[, tests$lc[rows], drop = FALSE]) /
+            max(nvK[Bt, v], 1)^2
         }
       }
     }
@@ -243,30 +301,15 @@ print.LRmap <- function(x, ...) {
   list(lambda = lam, mu = mu)
 }
 
-# remove transcripts leaked from touching cells of other types (edgeicg's leak model, contact kNN graph):
-# y_i - sum_j wn_ij lambda[t_i, t_j] y_j - (sum_j wn_ij mu[t_i, t_j]) * mean_{t_i}(y). Also returns the Poisson
-# variance of the subtracted term, V_i = sum_j (wn_ij lambda)^2 y_j * 100 / lib_j.
-.unleak <- function(Y, tcode, K, coords, k, lm, lib) {
+# leak operator on the contact kNN graph (edgeicg's model): W x = sum_j wn_ij lambda[t_i, t_j] x_j over touching
+# cells of other types; cmu_i = sum_j wn_ij mu[t_i, t_j]; W2 has the squared weights (variance of W x)
+.leak_W <- function(coords, tcode, k, lm) {
   n <- nrow(coords); nn <- RANN::nn2(coords, k = k + 1)
   recv <- rep(seq_len(n), k); send <- as.vector(nn$nn.idx[, -1]); d <- as.vector(nn$nn.dists[, -1])
   w <- exp(-d / stats::median(d)); wn <- w / pmax(.rsum(w, recv, n)[recv], EPS)
   het <- tcode[recv] != tcode[send]; tr <- tcode[recv]; ts <- tcode[send]
-  Wl <- Matrix::sparseMatrix(i = recv, j = send, x = wn * lm$lambda[cbind(tr, ts)] * het, dims = c(n, n))
-  cmu <- .rsum(wn * lm$mu[cbind(tr, ts)] * het, recv, n)
-  a <- rowsum(Y, tcode) / tabulate(tcode, K)[sort(unique(tcode))]
-  am <- matrix(0, K, ncol(Y)); am[as.integer(rownames(a)), ] <- a
-  Wl2 <- Wl; Wl2@x <- Wl2@x^2
-  list(Y = Y - as.matrix(Wl %*% Y) - cmu * am[tcode, , drop = FALSE],
-       V = as.matrix(Wl2 %*% (pmax(Y, 0) * (100 / pmax(lib, 1)))))
-}
-
-# variance of an entity's correction: ligand = the subunit at the minimum, receptor = mean of subunits
-.entity_var <- function(names, subunits, Y, V, fun) {
-  u <- !duplicated(names); names <- names[u]; subunits <- subunits[u]
-  out <- vapply(subunits, function(g) {
-    if (length(g) == 1) return(V[, g])
-    if (fun == "min") { w <- max.col(-Y[, g, drop = FALSE], ties.method = "first"); V[, g][cbind(seq_len(nrow(V)), w)] }
-    else rowSums(V[, g, drop = FALSE]) / length(g)^2
-  }, numeric(nrow(V)))
-  out <- matrix(out, nrow(V)); colnames(out) <- names; out
+  x <- wn * lm$lambda[cbind(tr, ts)] * het
+  list(W = Matrix::sparseMatrix(i = recv, j = send, x = x, dims = c(n, n)),
+       W2 = Matrix::sparseMatrix(i = recv, j = send, x = x^2, dims = c(n, n)),
+       cmu = .rsum(wn * lm$mu[cbind(tr, ts)] * het, recv, n))
 }
