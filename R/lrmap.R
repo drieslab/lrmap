@@ -231,10 +231,10 @@ lrmap <- function(counts, coords, types, lr, lib = NULL, scales = c("contact", "
   R <- do.call(rbind, res)
   out <- data.frame(sender = lev[R$A], receiver = lev[R$Bt], ligand = c(tab$ligand, ".cells")[R$p],
                     receptor = c(tab$receptor, ".cells")[R$p], scale = R$scale, score = R$score,
-                    null_mean = R$null_mean, fold = R$score / pmax(R$null_mean, EPS), z = R$z, p = R$pv,
+                    null_mean = R$null_mean, fold = .ratio(R$score, R$null_mean), z = R$z, p = R$pv,
                     p_emp = R$p_emp, q = NA_real_, mean_L = mLx[cbind(R$A, R$li)], mean_R = mRx[cbind(R$Bt, R$ri)],
                     det_L = dL[cbind(R$A, R$li)], det_R = dR[cbind(R$Bt, R$ri)], n_sender = nt[R$A],
-                    n_receiver = nt[R$Bt], fold_type = R$score / pmax(R$expected_type, EPS), z_type = R$z_type,
+                    n_receiver = nt[R$Bt], fold_type = .ratio(R$score, R$expected_type), z_type = R$z_type,
                     p_type = R$p_type, q_type = NA_real_, z_shuffle = R$z_shuffle, p_shuffle = R$p_shuffle,
                     q_shuffle = NA_real_, stringsAsFactors = FALSE)
   cells <- out$ligand == ".cells"
@@ -328,6 +328,9 @@ lrmap <- function(counts, coords, types, lr, lib = NULL, scales = c("contact", "
   z <- (S0 - E) / sqrt(pmax(V, EPS)); z[V < EPS] <- 0
   data.frame(z_shuffle = z, p_shuffle = stats::pnorm(z, lower.tail = FALSE))
 }
+
+# fold: NA when the expectation is not positive (leak-corrected values can be <= 0)
+.ratio <- function(x, e) ifelse(e > EPS, x / pmax(e, EPS), NA_real_)
 
 # null summaries per test row: S = tests x (1 + B), first column observed; V = excess sampling variance of the
 # observed score over shifted alignments (heteroscedastic noise tied to the observed layout), added to the

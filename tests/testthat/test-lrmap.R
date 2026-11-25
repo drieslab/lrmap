@@ -146,3 +146,7 @@ test_that("a cell type with a single cell does not break leak removal or the exp
   expect_no_error(lrmap(s$counts, s$coords, s$types, s$lr, lib = s$lib, B = 5, min_shift = 150, leak = s$leak,
                         scales = c("contact", "expression"), verbose = FALSE))
 })
+
+test_that("fold is NA, not huge, when the expectation is not positive", {
+  expect_equal(lrmap:::.ratio(c(1, -2, 3), c(2, 0, -1)), c(0.5, NA, NA))
+})
