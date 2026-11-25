@@ -84,7 +84,7 @@ test_that("the Rust backend equals the R backend (scores, null, variance), with 
 test_that("lrmap_leak recovers planted leak and matches edgeicg's estimate", {
   s <- lrmap_simulate("touch", size = 900, n_clusters = 8, leak = 0.08, n_genes = 150, seed = 6)
   lk <- lrmap_leak(s$counts, s$coords, s$types, s$lib, min_cells = 30, verbose = FALSE)
-  med <- stats::median(lk$lambda, na.rm = TRUE)               # planted 0.08 between every touching type pair
+  med <- stats::median(lk$lambda_raw, na.rm = TRUE)               # planted 0.08 between every touching type pair
   expect_true(med > 0.04 && med < 0.12)
   skip_if_not_installed("edgeicg")
   f <- edgeicg::edgeicg(s$counts, s$coords, s$types, lib = s$lib, min_cells = 30L, calibrate = FALSE, attribute = FALSE,
@@ -92,7 +92,7 @@ test_that("lrmap_leak recovers planted leak and matches edgeicg's estimate", {
   P <- f$pairs; ref <- data.frame(receiver = f$types[P$receiver], sender = f$types[P$sender], lambda = P$lambda, mu = P$mu)
   m <- merge(lk, ref, by = c("receiver", "sender"))
   expect_equal(nrow(m), nrow(ref))
-  expect_equal(m$lambda.x, m$lambda.y, tolerance = 1e-6); expect_equal(m$mu.x, m$mu.y, tolerance = 1e-6)
+  expect_equal(m$lambda_raw, m$lambda.y, tolerance = 1e-6); expect_equal(m$mu_raw, m$mu.y, tolerance = 1e-6)
 })
 
 test_that("leak removal: spill_edges equal to the default graph give the same result; cell order does not matter", {
@@ -149,4 +149,18 @@ test_that("a cell type with a single cell does not break leak removal or the exp
 
 test_that("fold is NA, not huge, when the expectation is not positive", {
   expect_equal(lrmap:::.ratio(c(1, -2, 3), c(2, 0, -1)), c(0.5, NA, NA))
+})
+
+test_that("leak pairs with little contact or out-of-range estimates are not corrected", {
+  s <- lrmap_simulate("touch", size = 900, n_clusters = 8, leak = 0.08, n_genes = 150, seed = 6)
+  lk <- lrmap_leak(s$counts, s$coords, s$types, s$lib, min_cells = 30, verbose = FALSE)
+  expect_true(all(is.na(lk$lambda[lk$status != "ok"])))
+  expect_true(all(lk$support[lk$status == "ok"] >= 30))
+  lk2 <- lrmap_leak(s$counts, s$coords, s$types, s$lib, min_cells = 30, min_support = 1e9, verbose = FALSE)
+  expect_true(all(lk2$status %in% c("low support", "no contact")))
+  # lrmap ignores supplied coefficients that are out of range: same result as without them
+  bad <- s$leak; bad$lambda <- 5; bad$mu <- 0
+  f0 <- lrmap(s$counts, s$coords, s$types, s$lr, lib = s$lib, B = 5, min_shift = 150, scales = "contact", verbose = FALSE)
+  f1 <- lrmap(s$counts, s$coords, s$types, s$lr, lib = s$lib, B = 5, min_shift = 150, scales = "contact", leak = bad, verbose = FALSE)
+  expect_equal(f0$table$score, f1$table$score)
 })

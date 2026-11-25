@@ -122,8 +122,14 @@ lrmap <- function(counts, coords, types, lr, lib = NULL, scales = c("contact", "
     ct <- if (is.null(spill_edges)) NULL else {
       e <- as.data.frame(spill_edges); inv <- order(ord); list(recv = inv[e$recv], send = inv[e$send], w = e$w) }
     ct <- .lk_edges(coords, k, ct)
-    lw <- .leak_W(ct, tcode, .leak_mats(leak, lev))
     ex <- .lk_exposures(coords, tcode, K, utils::modifyList(LEAK_DEF, list(k = k)), rs)
+    lm <- .leak_mats(leak, lev); sup <- rowsum(ex$C, tcode)[as.character(seq_len(K)), , drop = FALSE]
+    off_ <- sup < LEAK_DEF$min_support | lm$lambda < 0 | lm$lambda > 1 | lm$mu < -1 | lm$mu > 1
+    off_ <- off_ & (lm$lambda != 0 | lm$mu != 0)
+    if (any(off_)) say("leak: %d receiver-sender pair(s) not corrected (contact support < %g or outside the physical range)",
+                       sum(off_), LEAK_DEF$min_support)
+    lm$lambda[off_] <- 0; lm$mu[off_] <- 0
+    lw <- .leak_W(ct, tcode, lm)
     a <- .lk_intercepts(.lk_designs(ex, tcode, K, lib, LEAK_DEF$min_cells), Y, K); a[is.na(a)] <- 0; rm(ex)
     lc <- list(WY = lw$W %*% Y, cmu = lw$cmu, a = a, W2 = lw$W2); rm(lw)
   }

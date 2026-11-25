@@ -13,7 +13,7 @@
 # kernel normalisation cancels).
 
 LEAK_DEF <- list(k = 8, sigma_p = 25, sigma_n = 150, bin = 10, max_k = 400, min_cells = 60L, min_det = 0.01,
-                 huber = 1.345)
+                 huber = 1.345, min_support = 30)
 
 # touching edges: kNN (k, weight exp(-d / median d)) or user edges (recv, send, w)
 .lk_edges <- function(coords, k, spill_edges = NULL) {
@@ -122,12 +122,19 @@ LEAK_DEF <- list(k = 8, sigma_p = 25, sigma_n = 150, bin = 10, max_k = 400, min_
 #'   from cell outlines; default: k nearest neighbours with weight exp(-d / median d).
 #' @param k,sigma_p,sigma_n,bin neighbourhood settings of the first-stage regression.
 #' @param min_cells receiver types with fewer cells are not fitted. @param min_det gene filter (see `genes`).
+#' @param min_support a receiver-sender pair is estimated only when the receivers' contact shares of the sender
+#'   type sum to at least this (about this many fully touching receivers); otherwise `lambda` and `mu` are NA
+#'   (no correction). Estimates outside the physical range (`lambda` in [0, 1], `mu` in [-1, 1]) are also set to
+#'   NA and flagged.
 #' @param block genes read and fitted at a time. @param verbose progress messages.
-#' @return data.frame with `receiver`, `sender`, `lambda`, `mu` (attribute `n_genes`).
+#' @return data.frame with `receiver`, `sender`, `lambda`, `mu`, `support` (summed contact share), `status`
+#'   ("ok", "low support", "out of range", "no contact" or "not fitted"; raw estimates of flagged pairs in
+#'   `lambda_raw`, `mu_raw`), attribute `n_genes`.
 #' @export
 lrmap_leak <- function(counts, coords, types, lib = NULL, genes = NULL, spill_edges = NULL, k = LEAK_DEF$k,
                        sigma_p = LEAK_DEF$sigma_p, sigma_n = LEAK_DEF$sigma_n, bin = LEAK_DEF$bin,
-                       min_cells = LEAK_DEF$min_cells, min_det = LEAK_DEF$min_det, block = 300L, verbose = TRUE) {
+                       min_cells = LEAK_DEF$min_cells, min_det = LEAK_DEF$min_det, min_support = LEAK_DEF$min_support,
+                       block = 300L, verbose = TRUE) {
   t0 <- proc.time()[[3]]
   say <- function(...) if (verbose) message(sprintf("[lrmap_leak %5.0f s] ", proc.time()[[3]] - t0), sprintf(...))
   coords <- as.matrix(coords)[, 1:2, drop = FALSE]; n <- nrow(coords)
@@ -138,7 +145,9 @@ lrmap_leak <- function(counts, coords, types, lib = NULL, genes = NULL, spill_ed
   if (is.null(lib)) lib <- Matrix::colSums(counts)
   lib <- pmax(as.numeric(lib), 1)
   o <- utils::modifyList(LEAK_DEF, list(k = k, sigma_p = sigma_p, sigma_n = sigma_n, bin = bin))
-  ex <- .lk_exposures(coords, tcode, K, o); ds <- .lk_designs(ex, tcode, K, lib, min_cells); rm(ex)
+  ex <- .lk_exposures(coords, tcode, K, o); ds <- .lk_designs(ex, tcode, K, lib, min_cells)
+  support <- vapply(seq_len(nrow(ds$pairs)), function(p) sum(ex$C[tcode == ds$pairs$receiver[p], ds$pairs$sender[p]]), 0)
+  rm(ex)
   pairs <- ds$pairs; P_n <- nrow(pairs); fitted <- ds$fitted
   ct <- .lk_edges(coords, k, spill_edges)
   wn <- ct$w / pmax(.rsum(ct$w, ct$recv, n)[ct$recv], EPS); tr <- tcode[ct$recv]; ts <- tcode[ct$send]
@@ -177,8 +186,21 @@ lrmap_leak <- function(counts, coords, types, lib = NULL, genes = NULL, spill_ed
     lam[p] <- dc$lam; mu[p] <- dc$mu
   }
   say("done: %d genes", ncol(a))
-  structure(data.frame(receiver = lev[pairs$receiver], sender = lev[pairs$sender], lambda = lam, mu = mu,
-                       stringsAsFactors = FALSE), n_genes = ncol(a))
+  status <- ifelse(is.na(lam), "no contact", "ok")
+  status[status == "ok" & support < min_support] <- "low support"
+  status[status == "ok" & (lam < 0 | lam > 1 | mu < -1 | mu > 1)] <- "out of range"
+  bad <- status != "ok"
+  if (any(status == "out of range")) warning(sum(status == "out of range"), " leak estimate(s) outside the physical range set to NA")
+  out <- data.frame(receiver = lev[pairs$receiver], sender = lev[pairs$sender], lambda = ifelse(bad, NA_real_, lam),
+                    mu = ifelse(bad, NA_real_, mu), support = support, status = status, lambda_raw = lam, mu_raw = mu,
+                    stringsAsFactors = FALSE)
+  nf <- setdiff(seq_len(K), ds$fitted)                                  # receiver types too small to fit
+  if (length(nf)) {
+    ex <- expand.grid(receiver = lev[nf], sender = lev, stringsAsFactors = FALSE); ex <- ex[ex$receiver != ex$sender, ]
+    out <- rbind(out, data.frame(ex, lambda = NA_real_, mu = NA_real_, support = NA_real_, status = "not fitted",
+                                 lambda_raw = NA_real_, mu_raw = NA_real_))
+  }
+  structure(out, n_genes = ncol(a))
 }
 
 # leak table from a data.frame or an edgeicg fit (read by field names; edgeicg is not needed)
