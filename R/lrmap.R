@@ -29,7 +29,10 @@
 #'   a complex receptor the mean.
 #' @param lib library size per cell (all genes). Default: column sums of `counts` when it is a matrix holding all
 #'   genes; required with a reader.
-#' @param scales any of "contact", "paracrine", "niche".
+#' @param scales any of "contact", "paracrine", "niche", and "expression": the expression-only reference used
+#'   by single-cell analyses (mean ligand in the sender type x mean receptor in the receiver type against random
+#'   relabelling of cells, no spatial information), on the same tests and values; compare with
+#'   [lrmap_compare()].
 #' @param k contact neighbours. @param sigma_p,sigma_n paracrine and niche kernel widths (microns).
 #' @param bin_p,bin_n grid bins for paracrine and niche (microns); keep at most a third of the kernel width.
 #' @param B number of toroidal shifts. @param min_shift minimum shift length (microns).
@@ -37,9 +40,13 @@
 #'   the receptor (every subunit) in at least `min_det` of B cells.
 #' @param min_cells minimum cells of the sender and of the receiver type.
 #' @param same_type also test A = B.
-#' @param leak optional leak coefficients: an `EdgeICG` fit or a data.frame with `receiver`, `sender`
-#'   (type names), `lambda` and optionally `mu`. Transcripts leaked from touching cells of other types are then
-#'   removed from every cell before scoring.
+#' @param leak optional leak (spillover) correction: a data.frame with `receiver`, `sender` (type names), `lambda`
+#'   and optionally `mu` (e.g. from [lrmap_leak()]), an edgeICG fit (its leak coefficients are read; edgeICG is not
+#'   needed), or `TRUE` to estimate them with [lrmap_leak()] on all genes of `counts` (matrix input only).
+#'   Transcripts leaked from touching cells of other types are removed from every gene before ligand and receptor
+#'   values are formed: y - sum_j wn_ij lambda y_j - cmu_i a_t, with a_t the receiver type's first-stage baseline.
+#' @param spill_edges optional touching edges for the leak correction (`recv`, `send`, `w`; cell indices in the
+#'   order of `coords`), e.g. from cell outlines; default: the k nearest neighbours, weight exp(-d / median d).
 #' @param chunk ligands blurred at a time; default from the grid size (about `grid_mem` numbers per chunk).
 #' @param grid_mem numbers held per blurred chunk (sets the default `chunk`).
 #' @param z_cand the ligand-side part of the sampling variance on grid scales is computed for tests with z above
@@ -52,17 +59,21 @@
 #' @export
 lrmap <- function(counts, coords, types, lr, lib = NULL, scales = c("contact", "paracrine", "niche"), k = 8,
                   sigma_p = 25, sigma_n = 150, bin_p = 8, bin_n = 25, B = 200L, min_shift = 450, min_det = 0.05,
-                  min_cells = 30L, same_type = FALSE, leak = NULL, chunk = NULL, grid_mem = 4e7, z_cand = 1.5,
+                  min_cells = 30L, same_type = FALSE, leak = NULL, spill_edges = NULL, chunk = NULL, grid_mem = 4e7, z_cand = 1.5,
                   backend = c("auto", "rust", "r"), threads = 1L, seed = 1L, verbose = TRUE) {
   backend <- match.arg(backend); has_rs <- requireNamespace("lrmaprs", quietly = TRUE)
   if (backend == "rust" && !has_rs) stop("backend = 'rust' needs the lrmaprs package")
   rs <- if (backend != "r" && has_rs) as.integer(threads) else NULL
   t0 <- proc.time()[[3]]; tm <- c()
   say <- function(...) if (verbose) message(sprintf("[lrmap %5.0f s] ", proc.time()[[3]] - t0), sprintf(...))
-  scales <- match.arg(scales, c("contact", "paracrine", "niche"), several.ok = TRUE)
+  scales <- match.arg(scales, c("contact", "paracrine", "niche", "expression"), several.ok = TRUE)
   coords <- as.matrix(coords)[, 1:2, drop = FALSE]; n <- nrow(coords)
   if (length(types) != n) stop("coords and types must describe the same cells")
   types <- as.character(types); lev <- sort(unique(types)); K <- length(lev)
+  if (isTRUE(leak)) {
+    if (is.function(counts)) stop("leak = TRUE needs a counts matrix; with a reader, estimate with lrmap_leak()")
+    say("estimating leak coefficients on all genes"); leak <- lrmap_leak(counts, coords, types, lib, verbose = FALSE)
+  }
   # cells sorted by type: every type is a contiguous block
   ord <- order(match(types, lev)); tcode <- match(types, lev)[ord]; coords <- coords[ord, , drop = FALSE]
   nt <- tabulate(tcode, K); off <- c(0L, cumsum(nt))[seq_len(K)]
@@ -83,21 +94,25 @@ lrmap <- function(counts, coords, types, lr, lib = NULL, scales = c("contact", "
   Y <- Matrix::Diagonal(x = 100 / lib) %*% Matrix::t(Xg[unique(unlist(c(tab$lg, tab$rg))), , drop = FALSE])
   rm(Xg)
   Le <- .entities_sparse(tab$ligand, tab$lg, Y, "min"); Re <- .entities_sparse(tab$receptor, tab$rg, Y, "mean")
-  rm(Y)
+  subL <- tab$lg[match(colnames(Le$E), tab$ligand)]; subR <- tab$rg[match(colnames(Re$E), tab$receptor)]
   # sampling variance per cell: Poisson on the composition scale (y * 100 / lib; mean of k subunits: / k)
   pv <- 100 / lib
   VL <- Matrix::Diagonal(x = pv) %*% Le$E; VR <- Matrix::Diagonal(x = pv) %*% Re$E %*% Matrix::Diagonal(x = 1 / Re$k)
   Ty <- Matrix::sparseMatrix(i = tcode, j = seq_len(n), x = 1, dims = c(K, n))
-  aL <- as.matrix(Ty %*% Le$E) / nt; aR <- as.matrix(Ty %*% Re$E) / nt               # type means (before leak removal)
-  cmu <- numeric(n); Lc <- Le$E; Rc <- Re$E
-  if (!is.null(leak)) {   # leak removal (entity level): x - W x - cmu * type mean; variance of W x added
-    lw <- .leak_W(coords, tcode, k, .leak_mats(leak, lev)); cmu <- lw$cmu
-    Lc <- Le$E - lw$W %*% Le$E; Rc <- Re$E - lw$W %*% Re$E
+  lc <- NULL
+  if (!is.null(leak)) {   # leak removal per gene (y - W y - cmu * a_t), before ligand / receptor values are formed
+    ct <- if (is.null(spill_edges)) NULL else {
+      e <- as.data.frame(spill_edges); inv <- order(ord); list(recv = inv[e$recv], send = inv[e$send], w = e$w) }
+    ct <- .lk_edges(coords, k, ct)
+    lw <- .leak_W(ct, tcode, .leak_mats(leak, lev))
+    ex <- .lk_exposures(coords, tcode, K, utils::modifyList(LEAK_DEF, list(k = k)), rs)
+    a <- .lk_intercepts(.lk_designs(ex, tcode, K, lib, LEAK_DEF$min_cells), Y, K); a[is.na(a)] <- 0; rm(ex)
+    lc <- list(Y = Y, WY = lw$W %*% Y, cmu = lw$cmu, a = a)
     VL <- VL + lw$W2 %*% VL; VR <- VR + lw$W2 %*% VR; rm(lw)
   }
+  rm(Y)
   detL <- as.matrix(Ty %*% Le$D) / nt; detR <- as.matrix(Ty %*% Re$D) / nt
-  cm <- as.vector(Ty %*% cmu) / nt
-  mL <- as.matrix(Ty %*% Lc) / nt - cm * aL; mR <- as.matrix(Ty %*% Rc) / nt - cm * aR
+  Lc <- Le$E; Rc <- Re$E
   nl <- ncol(Lc); nr <- ncol(Rc)
 
   # tests: every (sender A, receiver B, pair) passing the expression filters, plus the type-level rows (.cells,
@@ -113,21 +128,49 @@ lrmap <- function(counts, coords, types, lr, lib = NULL, scales = c("contact", "
   say("%d of %d pairs covered; %d sender-receiver-pair tests per scale", tb$n_covered, tb$n,
       sum(tests$p <= nrow(tab)))
 
-  # dense blocks: per type, only the entities it is tested with (corrected values and their variances)
-  blk <- function(E, V, a, idx, side) {
+  # dense blocks: per type, only the entities it is tested with (values and their variances). With leak removal
+  # the subunit genes are corrected first and the entities formed from them (in chunks of entities).
+  ent_dense <- function(sub, fun, r, t) {
+    do.call(cbind, lapply(split(seq_along(sub), ceiling(seq_along(sub) / 100)), function(ii) {
+      g <- unique(unlist(sub[ii]))
+      G <- as.matrix(lc$Y[r, g, drop = FALSE]) - as.matrix(lc$WY[r, g, drop = FALSE]) - outer(lc$cmu[r], lc$a[t, g])
+      colnames(G) <- g
+      vapply(sub[ii], function(s) if (length(s) == 1) G[, s] else if (fun == "min") do.call(pmin, as.data.frame(G[, s]))
+             else rowMeans(G[, s]), numeric(length(r)))
+    }))
+  }
+  blk <- function(E, V, sub, fun, idx, side) {
     lapply(seq_len(K), function(t) {
       cols <- sort(unique(idx[tests[[side]] == t])); if (!length(cols)) return(NULL)
       ent <- cols[cols <= ncol(E)]; r <- rng[[t]]
       M <- matrix(1, length(r), length(cols)); Vv <- matrix(0, length(r), length(cols))
       if (length(ent)) {
         w <- match(ent, cols)
-        M[, w] <- as.matrix(E[r, ent, drop = FALSE]) - outer(cmu[r], a[t, ent])
+        M[, w] <- if (is.null(lc)) as.matrix(E[r, ent, drop = FALSE]) else ent_dense(sub[ent], fun, r, t)
         Vv[, w] <- as.matrix(V[r, ent, drop = FALSE])
       }
       list(M = M, V = Vv, cols = cols)
     })
   }
-  Lb <- blk(Lc, VL, aL, tests$li, "A"); Rb <- blk(Rc, VR, aR, tests$ri, "Bt")
+  Lb <- blk(Lc, VL, subL, "min", tests$li, "A"); Rb <- blk(Rc, VR, subR, "mean", tests$ri, "Bt")
+  # expression-only reference: mean and variance of every tested entity over all cells (label-shuffle null)
+  est <- function(E, sub, fun, ents) {
+    s1 <- s2 <- numeric(length(ents))
+    if (is.null(lc)) { Es <- E[, ents, drop = FALSE]; s1 <- Matrix::colSums(Es); s2 <- Matrix::colSums(Es^2) }
+    else for (ii in split(seq_along(ents), ceiling(seq_along(ents) / 100))) for (t in seq_len(K)) {
+      M <- ent_dense(sub[ents[ii]], fun, rng[[t]], t); s1[ii] <- s1[ii] + colSums(M); s2[ii] <- s2[ii] + colSums(M^2)
+    }
+    m <- s1 / n; v <- numeric(ncol(E) + 1L); mm <- numeric(ncol(E) + 1L)
+    mm[ents] <- m; v[ents] <- pmax(s2 / n - m^2, 0); list(mean = mm, var = v)
+  }
+  if ("expression" %in% scales) {
+    xt <- tests$p <= nrow(tab)
+    stL <- est(Lc, subL, "min", sort(unique(tests$li[xt]))); stR <- est(Rc, subR, "mean", sort(unique(tests$ri[xt])))
+  }
+  rm(lc)
+  bmean <- function(Bl, ncol_) { m <- matrix(NA_real_, K, ncol_)
+    for (t in seq_len(K)) if (!is.null(Bl[[t]])) m[t, Bl[[t]]$cols] <- colMeans(Bl[[t]]$M); m }
+  mLx <- bmean(Lb, nl + 1L); mRx <- bmean(Rb, nr + 1L)
   tests$lc <- vapply(seq_len(nrow(tests)), function(i) match(tests$li[i], Lb[[tests$A[i]]]$cols), 1L)
   tests$rc <- vapply(seq_len(nrow(tests)), function(i) match(tests$ri[i], Rb[[tests$Bt[i]]]$cols), 1L)
   rm(Lc, Rc, VL, VR, Le, Re)
@@ -139,7 +182,7 @@ lrmap <- function(counts, coords, types, lr, lib = NULL, scales = c("contact", "
   ctx <- list(coords = coords, tcode = tcode, K = K, off = off, rng = rng, Lb = Lb, Rb = Rb, tests = tests,
               sh = sh, box = box, rs = rs)
   res <- list()
-  for (s in scales) {
+  for (s in setdiff(scales, "expression")) {
     t1 <- proc.time()[[3]]
     S <- if (s == "contact") .scores_contact(ctx, k)
          else .scores_grid(ctx, if (s == "paracrine") sigma_p else sigma_n, if (s == "paracrine") bin_p else bin_n,
@@ -147,8 +190,8 @@ lrmap <- function(counts, coords, types, lr, lib = NULL, scales = c("contact", "
     res[[s]] <- .summarise(S$S, S$V, tests, s)
     tm[s] <- proc.time()[[3]] - t1; say("%s done", s)
   }
+  if ("expression" %in% scales) res$expression <- .expression_test(tests[xt, ], mLx, mRx, stL, stR, nt, n)
   R <- do.call(rbind, res)
-  mLx <- cbind(mL, 1); mRx <- cbind(mR, 1)
   out <- data.frame(sender = lev[R$A], receiver = lev[R$Bt], ligand = c(tab$ligand, ".cells")[R$p],
                     receptor = c(tab$receptor, ".cells")[R$p], scale = R$scale, score = R$score,
                     null_mean = R$null_mean, fold = R$score / pmax(R$null_mean, EPS), z = R$z, p = R$pv,
@@ -168,6 +211,21 @@ lrmap <- function(counts, coords, types, lr, lib = NULL, scales = c("contact", "
                                  min_cells = min_cells, same_type = same_type, leak = !is.null(leak),
                                  backend = if (is.null(rs)) "r" else "rust", threads = threads),
                  timing = tm), class = "LRmap")
+}
+
+# Expression-only test (as in single-cell analyses, no spatial information): score = mean ligand in the sender type
+# x mean receptor in the receiver type; null = random relabelling of cells (type sizes kept). The shuffled group
+# means have exact moments (sampling without replacement); the product is approximated as normal with the
+# delta-method variance (the O(1/n) covariance between disjoint groups is ignored).
+.expression_test <- function(tests, mLx, mRx, stL, stR, nt, n) {
+  A <- tests$A; Bt <- tests$Bt; li <- tests$li; ri <- tests$ri
+  obs <- mLx[cbind(A, li)] * mRx[cbind(Bt, ri)]
+  muL <- stL$mean[li]; muR <- stR$mean[ri]
+  vL <- stL$var[li] / nt[A] * (n - nt[A]) / (n - 1); vR <- stR$var[ri] / nt[Bt] * (n - nt[Bt]) / (n - 1)
+  e0 <- muL * muR; sdv <- sqrt(muR^2 * vL + muL^2 * vR + vL * vR)
+  z <- (obs - e0) / pmax(sdv, EPS); z[sdv < EPS] <- 0
+  cbind(tests[, c("A", "Bt", "p", "li", "ri")], scale = "expression", score = obs, null_mean = e0, z = z,
+        pv = stats::pnorm(z, lower.tail = FALSE), p_emp = NA_real_)
 }
 
 # null summaries per test row: S = tests x (1 + B), first column observed; V = excess sampling variance of the
@@ -291,7 +349,7 @@ NVAR <- 21L
 #' @param q_thr q-value threshold. @param min_fold minimum score over the shifted-null mean.
 #' @return rows of `x$table` with q < `q_thr` and fold >= `min_fold`, by q.
 #' @export
-lrmap_results <- function(x, scale = c("contact", "paracrine", "niche"), q_thr = 0.05, min_fold = 1.25) {
+lrmap_results <- function(x, scale = c("contact", "paracrine", "niche", "expression"), q_thr = 0.05, min_fold = 1.25) {
   tb <- x$table; keep <- which(tb$scale %in% scale & !is.na(tb$q) & tb$q < q_thr & tb$fold >= min_fold)
   r <- tb[keep, ]; r[order(r$q, -r$z), ]
 }
@@ -308,31 +366,35 @@ print.LRmap <- function(x, ...) {
   invisible(x)
 }
 
-# ---- leak -------------------------------------------------------------------------------------------------
-
-.leak_mats <- function(leak, lev) {
-  if (inherits(leak, "EdgeICG")) {
-    P <- leak$pairs; df <- data.frame(receiver = leak$types[P$receiver], sender = leak$types[P$sender],
-                                      lambda = P$lambda, mu = P$mu)
-  } else df <- as.data.frame(leak)
-  if (!all(c("receiver", "sender", "lambda") %in% names(df))) stop("leak needs receiver, sender and lambda")
-  if (is.null(df$mu)) df$mu <- 0
-  K <- length(lev); lam <- mu <- matrix(0, K, K)
-  ij <- cbind(match(df$receiver, lev), match(df$sender, lev)); ok <- stats::complete.cases(ij)
-  lam[ij[ok, , drop = FALSE]] <- ifelse(is.na(df$lambda[ok]), 0, df$lambda[ok])
-  mu[ij[ok, , drop = FALSE]] <- ifelse(is.na(df$mu[ok]), 0, df$mu[ok])
-  list(lambda = lam, mu = mu)
-}
-
-# leak operator on the contact kNN graph (edgeicg's model): W x = sum_j wn_ij lambda[t_i, t_j] x_j over touching
-# cells of other types; cmu_i = sum_j wn_ij mu[t_i, t_j]; W2 has the squared weights (variance of W x)
-.leak_W <- function(coords, tcode, k, lm) {
-  n <- nrow(coords); nn <- RANN::nn2(coords, k = k + 1)
-  recv <- rep(seq_len(n), k); send <- as.vector(nn$nn.idx[, -1]); d <- as.vector(nn$nn.dists[, -1])
-  w <- exp(-d / stats::median(d)); wn <- w / pmax(.rsum(w, recv, n)[recv], EPS)
-  het <- tcode[recv] != tcode[send]; tr <- tcode[recv]; ts <- tcode[send]
-  x <- wn * lm$lambda[cbind(tr, ts)] * het
-  list(W = Matrix::sparseMatrix(i = recv, j = send, x = x, dims = c(n, n)),
-       W2 = Matrix::sparseMatrix(i = recv, j = send, x = x^2, dims = c(n, n)),
-       cmu = .rsum(wn * lm$mu[cbind(tr, ts)] * het, recv, n))
+#' Expression-only calls versus spatial co-location
+#'
+#' For a fit with the "expression" scale and at least one spatial scale: one row per tested sender, receiver and
+#' ligand-receptor pair, with whether it is called on expression alone and at which spatial scales it is
+#' co-located, and whether the two cell types co-locate at all (`coloc`).
+#'
+#' @param x an `LRmap` object fitted with `scales` including "expression".
+#' @param q_thr,min_fold call thresholds (as in [lrmap_results()]).
+#' @return data.frame: sender, receiver, ligand, receptor, `expr_call`, `expr_z`, `spatial_scales` (called
+#'   scales joined by "+", "" if none), `spatial_call`, `types_colocated`, and `class`: "both",
+#'   "expression only", "spatial only" or "neither".
+#' @export
+lrmap_compare <- function(x, q_thr = 0.05, min_fold = 1.25) {
+  tb <- x$table; sp <- setdiff(x$settings$scales, "expression")
+  if (!"expression" %in% x$settings$scales || !length(sp)) stop("x needs the 'expression' scale and a spatial scale")
+  key <- function(d) paste(d$sender, d$receiver, d$ligand, d$receptor, sep = "\r")
+  call <- !is.na(tb$q) & tb$q < q_thr & tb$fold >= min_fold
+  ex <- tb[tb$scale == "expression", ]; k <- key(ex)
+  out <- data.frame(ex[, c("sender", "receiver", "ligand", "receptor")], expr_call = call[tb$scale == "expression"],
+                    expr_z = ex$z, stringsAsFactors = FALSE)
+  ss <- vapply(k, function(z) "", ""); names(ss) <- NULL
+  for (s in sp) {
+    w <- tb$scale == s & call; hit <- k %in% key(tb[w, ])
+    ss[hit] <- ifelse(ss[hit] == "", s, paste(ss[hit], s, sep = "+"))
+  }
+  out$spatial_scales <- ss; out$spatial_call <- ss != ""
+  cl <- x$coloc[x$coloc$scale %in% sp & !is.na(x$coloc$q) & x$coloc$q < q_thr, ]
+  out$types_colocated <- paste(out$sender, out$receiver) %in% paste(cl$sender, cl$receiver)
+  out$class <- ifelse(out$expr_call & out$spatial_call, "both", ifelse(out$expr_call, "expression only",
+                      ifelse(out$spatial_call, "spatial only", "neither")))
+  out
 }

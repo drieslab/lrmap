@@ -1,4 +1,6 @@
 export(lrmap)
+export(lrmap_compare)
+export(lrmap_leak)
 export(lrmap_results)
 export(lrmap_simulate)
 S3method(print, LRmap)

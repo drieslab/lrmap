@@ -46,7 +46,7 @@ test_that("grid score equals the blurred ligand share read at receivers, and the
 test_that("the leak operator removes planted leak to first order", {
   s <- lrmap_simulate("touch", size = 600, n_clusters = 4, leak = 0.05, leak_R = TRUE, seed = 4)
   tcs <- match(s$types, sort(unique(s$types)))
-  lw <- lrmap:::.leak_W(s$coords, tcs, 8, lrmap:::.leak_mats(s$leak, sort(unique(s$types))))
+  lw <- lrmap:::.leak_W(lrmap:::.lk_edges(s$coords, 8), tcs, lrmap:::.leak_mats(s$leak, sort(unique(s$types))))
   E <- matrix(ifelse(tcs == 1, 16, 0) / 3, ncol = 1); Yl <- E + as.matrix(lw$W %*% E)
   Yc <- Yl - as.matrix(lw$W %*% Yl); b <- tcs == 2
   expect_lt(max(abs(Yc[b] - E[b])), 0.01 * max(Yl[b]))
@@ -76,4 +76,54 @@ test_that("the Rust backend equals the R backend (scores, null, variance), with 
     expect_equal(b$table, a$table, tolerance = 1e-9); expect_equal(b$coloc, a$coloc, tolerance = 1e-9)
     expect_equal(c2$table, b$table)
   }
+})
+
+test_that("lrmap_leak recovers planted leak and matches edgeicg's estimate", {
+  s <- lrmap_simulate("touch", size = 900, n_clusters = 8, leak = 0.08, n_genes = 150, seed = 6)
+  lk <- lrmap_leak(s$counts, s$coords, s$types, s$lib, min_cells = 30, verbose = FALSE)
+  med <- stats::median(lk$lambda, na.rm = TRUE)               # planted 0.08 between every touching type pair
+  expect_true(med > 0.04 && med < 0.12)
+  skip_if_not_installed("edgeicg")
+  f <- edgeicg::edgeicg(s$counts, s$coords, s$types, lib = s$lib, min_cells = 30L, calibrate = FALSE, attribute = FALSE,
+                        backend = "r", verbose = FALSE)
+  P <- f$pairs; ref <- data.frame(receiver = f$types[P$receiver], sender = f$types[P$sender], lambda = P$lambda, mu = P$mu)
+  m <- merge(lk, ref, by = c("receiver", "sender"))
+  expect_equal(nrow(m), nrow(ref))
+  expect_equal(m$lambda.x, m$lambda.y, tolerance = 1e-6); expect_equal(m$mu.x, m$mu.y, tolerance = 1e-6)
+})
+
+test_that("leak removal: spill_edges equal to the default graph give the same result; cell order does not matter", {
+  s <- lrmap_simulate("touch", size = 600, n_clusters = 4, leak = 0.05, leak_R = TRUE, seed = 5)
+  run <- function(...) lrmap(s$counts, s$coords, s$types, s$lr, lib = s$lib, B = 15, min_shift = 150, leak = s$leak,
+                             backend = "r", verbose = FALSE, ...)
+  a <- run(); e <- lrmap:::.lk_edges(s$coords, 8)
+  b <- run(spill_edges = data.frame(recv = e$recv, send = e$send, w = e$w))
+  expect_equal(a$table, b$table)
+  p <- sample(ncol(s$counts)); inv <- order(p)
+  c2 <- lrmap(s$counts[, p], s$coords[p, ], s$types[p], s$lr, lib = s$lib[p], B = 15, min_shift = 150, leak = s$leak,
+              backend = "r", verbose = FALSE, spill_edges = data.frame(recv = inv[e$recv], send = inv[e$send], w = e$w))
+  expect_equal(a$table, c2$table)
+})
+
+test_that("the expression-only null matches label shuffles; far-apart types are called on expression only", {
+  s <- lrmap_simulate("far", size = 900, n_clusters = 10, seed = 8)
+  f <- lrmap(s$counts, s$coords, s$types, s$lr, lib = s$lib, B = 20, min_shift = 150, backend = "r", verbose = FALSE,
+             scales = c("contact", "niche", "expression"))
+  ex <- f$table[f$table$scale == "expression", ]
+  # Monte Carlo: shuffle the type labels, recompute mean L in A x mean R in B
+  y <- t(as.matrix(s$counts[c("L", "R"), ])) * 100 / s$lib
+  r1 <- ex[ex$ligand == "L" & ex$receptor == "R" & ex$sender == "A" & ex$receiver == "B", ]
+  r2 <- ex[ex$ligand != "L", ][1, ]
+  set.seed(3)
+  for (r in list(r1, r2)) {
+    yy <- if (r$ligand == "L") y else t(as.matrix(s$counts[c(r$ligand, r$receptor), ])) * 100 / s$lib
+    perm <- replicate(2000, { tp <- sample(s$types); mean(yy[tp == r$sender, 1]) * mean(yy[tp == r$receiver, 2]) })
+    expect_equal(r$null_mean, mean(perm), tolerance = 0.03)
+    zmc <- (r$score - mean(perm)) / stats::sd(perm)
+    expect_lt(abs(r$z - zmc), 0.1 * max(1, abs(zmc)))
+  }
+  cmp <- lrmap_compare(f)
+  lr1 <- cmp[cmp$sender == "A" & cmp$receiver == "B" & cmp$ligand == "L" & cmp$receptor == "R", ]
+  expect_equal(lr1$class, "expression only")
+  expect_false(lr1$types_colocated)
 })
