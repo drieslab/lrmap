@@ -62,3 +62,18 @@ test_that("cell order, reader input and repeat runs give the same results", {
   expect_gt(tp$z, 2); expect_equal(nrow(f$coloc), 3 * 12)
   expect_true(all(lrmap_results(f, "niche")$scale == "niche"))
 })
+
+test_that("the Rust backend equals the R backend (scores, null, variance), with and without leak", {
+  skip_if_not_installed("lrmaprs")
+  s <- lrmap_simulate("touch", size = 600, n_clusters = 4, leak = 0.05, leak_R = TRUE, seed = 5)
+  for (lk in list(NULL, s$leak)) {
+    a <- lrmap(s$counts, s$coords, s$types, s$lr, lib = s$lib, B = 25, min_shift = 150, verbose = FALSE, leak = lk,
+               backend = "r", z_cand = -Inf)
+    b <- lrmap(s$counts, s$coords, s$types, s$lr, lib = s$lib, B = 25, min_shift = 150, verbose = FALSE, leak = lk,
+               backend = "rust", z_cand = -Inf)
+    c2 <- lrmap(s$counts, s$coords, s$types, s$lr, lib = s$lib, B = 25, min_shift = 150, verbose = FALSE, leak = lk,
+                backend = "rust", threads = 2, z_cand = -Inf)
+    expect_equal(b$table, a$table, tolerance = 1e-9); expect_equal(b$coloc, a$coloc, tolerance = 1e-9)
+    expect_equal(c2$table, b$table)
+  }
+})

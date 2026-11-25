@@ -44,6 +44,8 @@
 #' @param grid_mem numbers held per blurred chunk (sets the default `chunk`).
 #' @param z_cand the ligand-side part of the sampling variance on grid scales is computed for tests with z above
 #'   this before it (adding variance only lowers z).
+#' @param backend "auto" uses the compiled kernels of the lrmaprs package when it is installed.
+#' @param threads threads for the compiled kernels (1: the calling thread only; 0: all cores).
 #' @param seed seed for the shifts. @param verbose progress messages.
 #' @return an `LRmap` object: `table` (one row per tested sender, receiver, pair and scale), `coloc`
 #'   (type-level co-location per scale), `n_pairs`, `n_covered`, `settings`, `timing`.
@@ -51,7 +53,10 @@
 lrmap <- function(counts, coords, types, lr, lib = NULL, scales = c("contact", "paracrine", "niche"), k = 8,
                   sigma_p = 25, sigma_n = 150, bin_p = 8, bin_n = 25, B = 200L, min_shift = 450, min_det = 0.05,
                   min_cells = 30L, same_type = FALSE, leak = NULL, chunk = NULL, grid_mem = 4e7, z_cand = 1.5,
-                  seed = 1L, verbose = TRUE) {
+                  backend = c("auto", "rust", "r"), threads = 1L, seed = 1L, verbose = TRUE) {
+  backend <- match.arg(backend); has_rs <- requireNamespace("lrmaprs", quietly = TRUE)
+  if (backend == "rust" && !has_rs) stop("backend = 'rust' needs the lrmaprs package")
+  rs <- if (backend != "r" && has_rs) as.integer(threads) else NULL
   t0 <- proc.time()[[3]]; tm <- c()
   say <- function(...) if (verbose) message(sprintf("[lrmap %5.0f s] ", proc.time()[[3]] - t0), sprintf(...))
   scales <- match.arg(scales, c("contact", "paracrine", "niche"), several.ok = TRUE)
@@ -132,7 +137,7 @@ lrmap <- function(counts, coords, types, lr, lib = NULL, scales = c("contact", "
   box <- c(min(coords[, 1]), diff(range(coords[, 1])) + 1e-6, min(coords[, 2]), diff(range(coords[, 2])) + 1e-6)
   sh <- .shifts(B, box, min_shift, seed)
   ctx <- list(coords = coords, tcode = tcode, K = K, off = off, rng = rng, Lb = Lb, Rb = Rb, tests = tests,
-              sh = sh, box = box)
+              sh = sh, box = box, rs = rs)
   res <- list()
   for (s in scales) {
     t1 <- proc.time()[[3]]
@@ -160,7 +165,8 @@ lrmap <- function(counts, coords, types, lr, lib = NULL, scales = c("contact", "
   structure(list(table = out[!cells, ], coloc = coloc, types = lev, n_pairs = tb$n, n_covered = tb$n_covered,
                  settings = list(scales = scales, k = k, sigma_p = sigma_p, sigma_n = sigma_n, bin_p = bin_p,
                                  bin_n = bin_n, B = B, min_shift = min_shift, min_det = min_det,
-                                 min_cells = min_cells, same_type = same_type, leak = !is.null(leak)),
+                                 min_cells = min_cells, same_type = same_type, leak = !is.null(leak),
+                                 backend = if (is.null(rs)) "r" else "rust", threads = threads),
                  timing = tm), class = "LRmap")
 }
 
@@ -183,8 +189,17 @@ NVAR <- 21L
 .scores_contact <- function(ctx, k) {
   coords <- ctx$coords; tcode <- ctx$tcode; K <- ctx$K; tests <- ctx$tests; sh <- ctx$sh
   nn <- RANN::nn2(coords, k = k + 1); d0 <- stats::median(as.vector(nn$nn.dists[, -1])); cap <- 3 * d0; rm(nn)
+  nvar <- min(NVAR, nrow(sh))
+  if (!is.null(ctx$rs)) {
+    em <- matrix(0, 0, 0); g <- function(L, f) lapply(L, function(b) if (is.null(b)) em else b[[f]])
+    o <- lrmaprs::rs_contact_scores(coords[, 1], coords[, 2], as.integer(tcode), as.integer(ctx$off),
+                                    g(ctx$Lb, "M"), g(ctx$Lb, "V"), g(ctx$Rb, "M"), g(ctx$Rb, "V"),
+                                    as.integer(tests$A), as.integer(tests$Bt), as.integer(tests$lc), as.integer(tests$rc),
+                                    sh, as.integer(k), d0, cap, ctx$box, as.integer(nvar), ctx$rs)
+    return(list(S = o$S, V = .excess(o$Vs)))
+  }
   bl <- split(seq_len(nrow(tests)), (tests$A - 1L) * K + tests$Bt)
-  nvar <- min(NVAR, nrow(sh)); S <- matrix(0, nrow(tests), nrow(sh)); Vs <- matrix(0, nrow(tests), nvar)
+  S <- matrix(0, nrow(tests), nrow(sh)); Vs <- matrix(0, nrow(tests), nvar)
   for (v in seq_len(nrow(sh))) {
     e <- .contact_edges(coords, k, d0, cap, if (v == 1) NULL else sh[v, ], ctx$box)
     nv <- tabulate(tcode[e$valid], K)
@@ -214,7 +229,8 @@ NVAR <- 21L
   if (is.null(chunk)) chunk <- max(1L, min(64L, floor(grid_mem / nc)))
   sxy <- cbind(round(sh[, 1] / bin), round(sh[, 2] / bin))
   linv <- function(idx, v) ((gr$gx[idx] - sxy[v, 1]) %% gr$nx) + ((gr$gy[idx] - sxy[v, 2]) %% gr$ny) * gr$nx + 1
-  Tf <- .blur(.bin_sum(matrix(1, n, 1), gr$lin, nc), gr)[, 1]
+  rs <- ctx$rs
+  Tf <- .blur(.bin_sum(matrix(1, n, 1), gr$lin, nc), gr, rs)[, 1]
   tau <- 0.1 * stats::median(Tf[gr$lin])
   nvK <- vapply(seq_len(nrow(sh)), function(v) tabulate(tcode[Tf[linv(seq_len(n), v)] >= tau], K), numeric(K))
   nvK <- matrix(nvK, K)
@@ -222,13 +238,20 @@ NVAR <- 21L
   for (A in unique(tests$A)) {
     ta <- which(tests$A == A); la <- unique(tests$lc[ta]); sa <- ctx$rng[[A]]; LB <- ctx$Lb[[A]]
     for (ch in split(la, ceiling(seq_along(la) / chunk))) {
-      Fq <- .blur(.bin_sum(LB$M[, ch, drop = FALSE], gr$lin[sa], nc), gr) / pmax(Tf, EPS)
+      Fq <- .blur(.bin_sum(LB$M[, ch, drop = FALSE], gr$lin[sa], nc), gr, rs) / pmax(Tf, EPS)
       Fq[Tf < tau, ] <- 0
       rows_c <- ta[tests$lc[ta] %in% ch]
       for (Bt in unique(tests$Bt[rows_c])) {
         rows <- rows_c[tests$Bt[rows_c] == Bt]; cb <- ctx$rng[[Bt]]; RB <- ctx$Rb[[Bt]]
         Rm <- RB$M[, tests$rc[rows], drop = FALSE]; VRB <- RB$V[, tests$rc[rows], drop = FALSE]
         lp <- match(tests$lc[rows], ch)
+        if (!is.null(rs)) {
+          o <- lrmaprs::rs_grid_gather(Fq, as.integer(gr$gx[cb]), as.integer(gr$gy[cb]), as.integer(sxy[, 1]),
+                                       as.integer(sxy[, 2]), as.integer(gr$nx), as.integer(gr$ny), Rm, VRB,
+                                       as.integer(lp), as.numeric(nvK[Bt, ]), as.integer(nvar), rs)
+          S[rows, ] <- o$S; Vs[rows, ] <- Vs[rows, ] + o$Vs
+          next
+        }
         for (v in seq_len(nrow(sh))) {
           lin <- linv(cb, v)
           Xv <- Fq[lin, lp, drop = FALSE]                                    # 0 where invalid (Tf < tau)
@@ -248,7 +271,7 @@ NVAR <- 21L
     for (v in seq_len(nvar)) {
       lin <- linv(cb, v); ok <- Tf[lin] >= tau; if (!any(ok)) next
       for (ch in split(rb, ceiling(seq_along(rb) / chunk))) {
-        G <- .blur(.bin_sum(RB$M[ok, ch, drop = FALSE] / Tf[lin[ok]], lin[ok], nc), gr)
+        G <- .blur(.bin_sum(RB$M[ok, ch, drop = FALSE] / Tf[lin[ok]], lin[ok], nc), gr, rs)
         rows_c <- tb[tests$rc[tb] %in% ch]
         for (A in unique(tests$A[rows_c])) {
           rows <- rows_c[tests$A[rows_c] == A]; sa <- ctx$rng[[A]]

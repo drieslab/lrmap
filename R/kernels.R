@@ -46,12 +46,14 @@ EPS <- 1e-12
     i <- rep(seq_len(m), each = length(off)); j <- i + rep(off, m); ok <- j >= 1 & j <= m
     Matrix::sparseMatrix(i = i[ok], j = j[ok], x = rep(ker, m)[ok], dims = c(m, m))
   }
-  list(nx = nx, ny = ny, gx = gx, gy = gy, lin = gx + gy * nx + 1, Kx = band(nx), Ky = band(ny), bin = bin)
+  r <- ceiling(3 * sigma / bin); ker <- exp(-0.5 * ((-r):r * bin)^2 / sigma^2)
+  list(nx = nx, ny = ny, gx = gx, gy = gy, lin = gx + gy * nx + 1, Kx = band(nx), Ky = band(ny), bin = bin, ker = ker)
 }
 
 # Blur several grids at once. V: (nx * ny) x m (column-major nx x ny per column) -> same shape. Rows (x) by
 # the band operator on the left, columns (y) by a block-diagonal band on the right: no transposes.
-.blur <- function(V, gr) {
+.blur <- function(V, gr, rs = NULL) {
+  if (!is.null(rs)) return(lrmaprs::rs_blur(V, as.integer(gr$nx), as.integer(gr$ny), gr$ker, as.integer(rs)))
   m <- ncol(V); A <- gr$Kx %*% matrix(V, gr$nx)                            # nx x (ny * m)
   A <- A %*% if (m == 1) gr$Ky else Matrix::bdiag(rep(list(gr$Ky), m))      # Ky symmetric
   matrix(as.matrix(A), gr$nx * gr$ny)
