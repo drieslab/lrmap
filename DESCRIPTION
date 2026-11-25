@@ -1,7 +1,7 @@
 Package: lrmap
 Type: Package
 Title: Multi-Scale Spatial Co-Location of Ligands and Receptors Between Cell Types
-Version: 0.0.1
+Version: 0.1.0
 Authors@R: person("Ruben", "Dries", email = "rdries@bu.edu", role = c("aut", "cre"))
 Description: For every sender and receiver cell type and every ligand-receptor pair, measures how
     much ligand from the sender type surrounds receiver cells that express the receptor, at three

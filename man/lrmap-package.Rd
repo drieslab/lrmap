@@ -7,6 +7,14 @@
 \description{
 For every sender and receiver cell type and every ligand-receptor pair, measures how much ligand from the sender type surrounds receiver cells that express the receptor, at three spatial scales: touching cells (contact), short-range neighbours (paracrine) and the regional neighbourhood (niche). Significance comes from toroidal shifts of the sender layer against the receiver layer, which keep each layer's own spatial pattern. Transcripts leaked between touching cells can be estimated and removed (lrmap_leak()).
 }
+\seealso{
+Useful links:
+\itemize{
+  \item \url{https://github.com/drieslab/lrmap}
+  \item Report bugs at \url{https://github.com/drieslab/lrmap/issues}
+}
+
+}
 \author{
 \strong{Maintainer}: Ruben Dries \email{rdries@bu.edu}
 

@@ -175,3 +175,13 @@ test_that("leak pooling: low-contact pairs get the receiver's pooled value; pool
   f1 <- lrmap(s$counts, s$coords, s$types, s$lr, lib = s$lib, B = 5, min_shift = 150, scales = "contact", leak = bad, verbose = FALSE)
   expect_equal(f0$table$score, f1$table$score)
 })
+
+test_that("lrmap_local averages to the table's score (no leak removal)", {
+  f <- lrmap(sim$counts, sim$coords, sim$types, pairLR, lib = sim$lib, B = 5, min_shift = 150, backend = "r",
+                    scales = c("contact", "paracrine", "niche"), verbose = FALSE)
+  for (s in c("contact", "paracrine", "niche")) {
+    loc <- lrmap_local(sim$counts, sim$coords, sim$types, "A", "B", "L", "R", s, lib = sim$lib)
+    row <- f$table[f$table$sender == "A" & f$table$receiver == "B" & f$table$scale == s, ]
+    expect_equal(mean(loc$local[sim$types == "B"]), row$score, tolerance = 1e-10)
+  }
+})
