@@ -178,6 +178,11 @@ lrmap <- function(counts, coords, types, lr, lib = NULL, scales = c("contact", "
                             sum(vapply(Rb, function(b) if (is.null(b)) 0 else length(b$M), 1))) * 16 / 2^20)
 
   box <- c(min(coords[, 1]), diff(range(coords[, 1])) + 1e-6, min(coords[, 2]), diff(range(coords[, 2])) + 1e-6)
+  reach <- max(0, c(paracrine = 3 * sigma_p, niche = 3 * sigma_n)[intersect(scales, c("paracrine", "niche"))])
+  if (min_shift < reach)
+    warning(sprintf(paste("min_shift (%.0f um) is shorter than the widest kernel's reach (3 sigma = %.0f um): shifted",
+                          "layouts stay partly aligned and the null is conservative; set min_shift >= %.0f"),
+                    min_shift, reach, reach), call. = FALSE)
   sh <- .shifts(B, box, min_shift, seed)
   ctx <- list(coords = coords, tcode = tcode, K = K, off = off, rng = rng, Lb = Lb, Rb = Rb, tests = tests,
               sh = sh, box = box, rs = rs)

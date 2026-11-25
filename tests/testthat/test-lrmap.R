@@ -1,3 +1,6 @@
+# small simulated sections use short shifts on purpose; the min_shift warning is tested on its own below
+lrmap <- function(...) suppressWarnings(lrmap::lrmap(...))
+
 sim <- lrmap_simulate("touch", size = 600, n_clusters = 4, seed = 3)
 Y <- t(as.matrix(sim$counts)) * (100 / sim$lib); tc <- match(sim$types, sort(unique(sim$types)))
 box <- c(min(sim$coords[, 1]), diff(range(sim$coords[, 1])) + 1e-6, min(sim$coords[, 2]), diff(range(sim$coords[, 2])) + 1e-6)
@@ -126,4 +129,12 @@ test_that("the expression-only null matches label shuffles; far-apart types are 
   lr1 <- cmp[cmp$sender == "A" & cmp$receiver == "B" & cmp$ligand == "L" & cmp$receptor == "R", ]
   expect_equal(lr1$class, "expression only")
   expect_false(lr1$types_colocated)
+})
+
+test_that("min_shift shorter than the widest kernel reach warns", {
+  s <- lrmap_simulate("touch", size = 600, n_clusters = 4, seed = 2)
+  expect_warning(lrmap::lrmap(s$counts, s$coords, s$types, s$lr, lib = s$lib, B = 5, min_shift = 150,
+                              scales = "niche", verbose = FALSE), "min_shift")
+  expect_no_warning(lrmap::lrmap(s$counts, s$coords, s$types, s$lr, lib = s$lib, B = 5, min_shift = 200,
+                                 scales = c("contact", "paracrine"), verbose = FALSE))
 })
