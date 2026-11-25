@@ -1,0 +1,19 @@
+Package: lrmap
+Type: Package
+Title: Multi-Scale Spatial Co-Location of Ligands and Receptors Between Cell Types
+Version: 0.0.1
+Authors@R: person("Ruben", "Dries", email = "rdries@bu.edu", role = c("aut", "cre"))
+Description: For every sender and receiver cell type and every ligand-receptor pair, measures how
+    much ligand from the sender type surrounds receiver cells that express the receptor, at three
+    spatial scales: touching cells (contact), short-range neighbours (paracrine) and the regional
+    neighbourhood (niche). Significance comes from toroidal shifts of the sender layer against the
+    receiver layer, which keep each layer's own spatial pattern. Transcripts leaked between
+    touching cells can be removed with leak coefficients from an 'edgeicg' fit.
+License: MIT + file LICENSE
+Encoding: UTF-8
+Depends: R (>= 4.2)
+Imports: Matrix, RANN, stats
+Suggests: testthat (>= 3.0.0), edgeicg
+Config/testthat/edition: 3
+Roxygen: list(markdown = TRUE)
+RoxygenNote: 7.3.3
