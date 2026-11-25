@@ -144,23 +144,26 @@ LEAK_DEF <- list(k = 8, sigma_p = 25, sigma_n = 150, bin = 10, max_k = 400, min_
 #'
 #' @param counts raw counts: genes x cells matrix with gene rownames, or a reader `function(genes)` (as in
 #'   [lrmap()]); with a reader, `genes` and `lib` are required.
-#' @param coords cells x 2 coordinates (microns). @param types cell type per cell.
+#' @param coords cells x 2 coordinates (microns).
+#' @param types cell type per cell.
 #' @param lib library size per cell (default: column sums of `counts`).
 #' @param genes genes to fit on (default: all rows of `counts`). Genes detected in fewer than `min_det` of the
 #'   cells of every receiver type are dropped.
 #' @param spill_edges optional touching edges (`recv`, `send`, `w`; cell indices in the order of `coords`), e.g.
 #'   from cell outlines; default: k nearest neighbours with weight exp(-d / median d).
 #' @param k,sigma_p,sigma_n,bin neighbourhood settings of the first-stage regression.
-#' @param min_cells receiver types with fewer cells are not fitted. @param min_det gene filter (see `genes`).
+#' @param min_cells receiver types with fewer cells are not fitted.
+#' @param min_det gene filter (see `genes`).
 #' @param min_support contact support (the receivers' contact shares of the sender type, summed: about the
 #'   number of fully touching receivers) at which a pair's own estimate gets half the weight in pooling.
 #' @param pool how pairs with little contact are handled. "median" (default): every pair's estimate is shrunk
 #'   toward the median of the well-supported pairs (support >= `min_support`) of its receiver type (all
 #'   well-supported pairs if it has none), with weight support / (support + `min_support`); pairs without a usable
-#'   estimate (little contact, outside the physical range `lambda` in [0, 1], `mu` in [-1, 1], or a receiver type
+#'   estimate (little contact, outside the physical range of `lambda` between 0 and 1 and `mu` between -1 and 1, or a receiver type
 #'   too small to fit) get that median. "q1": the same with the first quartile for `lambda` (less correction).
 #'   "none": no pooling; pairs with support below `min_support` or without a usable estimate are not corrected.
-#' @param block genes read and fitted at a time. @param verbose progress messages.
+#' @param block genes read and fitted at a time.
+#' @param verbose progress messages.
 #' @return data.frame with `receiver`, `sender`, `lambda`, `mu` (used for the correction), `support`, `status`
 #'   ("ok", "low support", "out of range" or "no estimate", prefixed "pooled: " when the pooled value was used),
 #'   and the pair's own estimates `lambda_raw`, `mu_raw`; attributes `n_genes`, `pool`.

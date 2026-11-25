@@ -33,9 +33,11 @@
 #'   by single-cell analyses (mean ligand in the sender type x mean receptor in the receiver type against random
 #'   relabelling of cells, no spatial information), on the same tests and values; compare with
 #'   [lrmap_compare()].
-#' @param k contact neighbours. @param sigma_p,sigma_n paracrine and niche kernel widths (microns).
+#' @param k contact neighbours.
+#' @param sigma_p,sigma_n paracrine and niche kernel widths (microns).
 #' @param bin_p,bin_n grid bins for paracrine and niche (microns); keep at most a third of the kernel width.
-#' @param B number of toroidal shifts. @param min_shift minimum shift length (microns).
+#' @param B number of toroidal shifts.
+#' @param min_shift minimum shift length (microns).
 #' @param min_det a pair is tested for (A, B) when the ligand is detected in at least `min_det` of A cells and
 #'   the receptor (every subunit) in at least `min_det` of B cells.
 #' @param min_cells minimum cells of the sender and of the receiver type.
@@ -55,7 +57,8 @@
 #'   this before it (adding variance only lowers z).
 #' @param backend "auto" uses the compiled kernels of the lrmaprs package when it is installed.
 #' @param threads threads for the compiled kernels (1: the calling thread only; 0: all cores).
-#' @param seed seed for the shifts. @param verbose progress messages.
+#' @param seed seed for the shifts.
+#' @param verbose progress messages.
 #' @details Three tests are reported for every spatial row. `q` (with `z`, `fold`): co-location of ligand-expressing
 #'   senders and receptor-expressing receivers against shifted sender layers; this includes the co-location of
 #'   the two cell types, so any pair expressed in two neighbouring types is called. `q_type` (with `z_type`,
@@ -463,13 +466,15 @@ NVAR <- 21L
 
 #' Significant ligand-receptor co-location
 #'
-#' @param x an `LRmap` object. @param scale scales to keep.
+#' @param x an `LRmap` object.
+#' @param scale scales to keep.
 #' @param test which null: "type" (pair co-location beyond the co-location of the two cell types, calibrated by
 #'   the shifts; `q_type`, `fold_type`), "shuffle" (ligand and receptor values shuffled within their cell
 #'   types, layout fixed; `q_shuffle`, `fold_type`) or "colocation" (shifted sender layer: co-location of
 #'   ligand-expressing senders and receptor-expressing receivers, including the co-location of the two types;
 #'   `q`, `fold`). The expression scale always uses `q` and `fold`.
-#' @param q_thr q-value threshold. @param min_fold minimum fold (see `test`).
+#' @param q_thr q-value threshold.
+#' @param min_fold minimum fold (see `test`).
 #' @return rows of `x$table` passing the thresholds, by q.
 #' @export
 lrmap_results <- function(x, scale = c("contact", "paracrine", "niche", "expression"), test = c("type", "shuffle", "colocation"),

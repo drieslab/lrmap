@@ -11,13 +11,17 @@
 #' random as decoys.
 #'
 #' @param layout one of "touch", "gap", "far", "indep".
-#' @param size side of the square section (microns). @param spacing lattice spacing (microns).
-#' @param n_clusters A clusters. @param r_a A cluster radius (microns).
+#' @param size side of the square section (microns).
+#' @param spacing lattice spacing (microns).
+#' @param n_clusters A clusters.
+#' @param r_a A cluster radius (microns).
 #' @param mu_l,mu_r mean counts of L in A and R in B (at the mean library).
 #' @param leak fraction of each touching neighbour's expression leaked into a cell (other types only).
 #' @param leak_R express R in A instead of B (leak scenario).
 #' @param gap width of the C ring in the `gap` layout (microns).
-#' @param n_genes decoy genes. @param n_decoy decoy pairs. @param lib_mean mean library size.
+#' @param n_genes decoy genes.
+#' @param n_decoy decoy pairs.
+#' @param lib_mean mean library size.
 #' @param induce interface induction: `L` in A cells and `R` in B cells scale with (1 + `induce` x the cell's
 #'   contact share of the other type), renormalised to the same type mean (0: expression is type-level only).
 #' @param seed random seed.
