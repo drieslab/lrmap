@@ -128,7 +128,7 @@ lrmap <- function(counts, coords, types, lr, lib = NULL, scales = c("contact", "
     # coefficients from lrmap_leak() are used as given; others (an edgeICG fit, a plain table) are pooled here
     lt <- .leak_table(leak)
     if (is.null(lt$status)) {
-      sup <- rowsum(ex$C, tcode)[as.character(seq_len(K)), , drop = FALSE]
+      sup <- .lk_support(ct, tcode, K)
       ij <- cbind(match(lt$receiver, lev), match(lt$sender, lev)); ok <- stats::complete.cases(ij)
       lt <- lt[ok, , drop = FALSE]; ij <- ij[ok, , drop = FALSE]
       pl <- .leak_pool(ij[, 1], lt$lambda, lt$mu, sup[ij], leak_pool, LEAK_DEF$min_support)

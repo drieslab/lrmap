@@ -92,7 +92,13 @@ test_that("lrmap_leak recovers planted leak and matches edgeicg's estimate", {
   P <- f$pairs; ref <- data.frame(receiver = f$types[P$receiver], sender = f$types[P$sender], lambda = P$lambda, mu = P$mu)
   m <- merge(lk, ref, by = c("receiver", "sender"))
   expect_equal(nrow(m), nrow(ref))
-  expect_equal(m$lambda_raw, m$lambda.y, tolerance = 1e-6); expect_equal(m$mu_raw, m$mu.y, tolerance = 1e-6)
+  raw <- if (is.null(P$lambda_raw)) P$lambda else P$lambda_raw; rmu <- if (is.null(P$mu_raw)) P$mu else P$mu_raw
+  ref$lambda_r <- raw; ref$mu_r <- rmu; m <- merge(lk, ref, by = c("receiver", "sender"))
+  expect_equal(m$lambda_raw, m$lambda_r, tolerance = 1e-6); expect_equal(m$mu_raw, m$mu_r, tolerance = 1e-6)
+  if (!is.null(P$leak_status)) {                     # edgeicg with pooling: same pooled values and support
+    expect_equal(m$lambda.x, m$lambda.y, tolerance = 1e-6); expect_equal(m$mu.x, m$mu.y, tolerance = 1e-6)
+    expect_equal(m$status, P$leak_status[match(paste(m$receiver, m$sender), paste(ref$receiver, ref$sender))])
+  }
 })
 
 test_that("leak removal: spill_edges equal to the default graph give the same result; cell order does not matter", {

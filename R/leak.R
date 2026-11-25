@@ -82,6 +82,14 @@ LEAK_DEF <- list(k = 8, sigma_p = 25, sigma_n = 150, bin = 10, max_k = 400, min_
   a
 }
 
+# contact support per receiver x sender type (K x K): normalised touching-edge weights summed over the receivers,
+# i.e. the receivers' contact shares of the sender type, summed (edgeicg: sw_p)
+.lk_support <- function(ct, tcode, K) {
+  n <- length(tcode); wn <- ct$w / pmax(.rsum(ct$w, ct$recv, n)[ct$recv], EPS)
+  S <- matrix(0, K, K); r <- rowsum(wn, (tcode[ct$send] - 1L) * K + tcode[ct$recv])   # S[receiver, sender]
+  S[as.integer(rownames(r))] <- r[, 1]; S
+}
+
 # Huber regression across genes of a pair's contact coefficients on the touching-sender profile (lambda) and the
 # receiver baseline (mu); lambda >= 0 (edgeicg .decompose)
 .lk_decompose <- function(beta, se, ak, at, huber = 1.345, iters = 50) {
@@ -173,7 +181,7 @@ lrmap_leak <- function(counts, coords, types, lib = NULL, genes = NULL, spill_ed
   lib <- pmax(as.numeric(lib), 1)
   o <- utils::modifyList(LEAK_DEF, list(k = k, sigma_p = sigma_p, sigma_n = sigma_n, bin = bin))
   ex <- .lk_exposures(coords, tcode, K, o); ds <- .lk_designs(ex, tcode, K, lib, min_cells)
-  Csum <- rowsum(ex$C, tcode)[as.character(seq_len(K)), , drop = FALSE]; rm(ex)
+  rm(ex)
   pairs <- ds$pairs; P_n <- nrow(pairs); fitted <- ds$fitted
   ct <- .lk_edges(coords, k, spill_edges)
   wn <- ct$w / pmax(.rsum(ct$w, ct$recv, n)[ct$recv], EPS); tr <- tcode[ct$recv]; ts <- tcode[ct$send]
@@ -214,7 +222,7 @@ lrmap_leak <- function(counts, coords, types, lib = NULL, genes = NULL, spill_ed
   say("done: %d genes", ncol(a))
   full <- expand.grid(receiver = seq_len(K), sender = seq_len(K)); full <- full[full$receiver != full$sender, ]
   m <- match(paste(full$receiver, full$sender), paste(pairs$receiver, pairs$sender))
-  lr0 <- lam[m]; mr0 <- mu[m]; sp <- Csum[cbind(full$receiver, full$sender)]
+  lr0 <- lam[m]; mr0 <- mu[m]; sp <- .lk_support(ct, tcode, K)[cbind(full$receiver, full$sender)]
   pl <- .leak_pool(full$receiver, lr0, mr0, sp, pool, min_support)
   out <- data.frame(receiver = lev[full$receiver], sender = lev[full$sender], lambda = pl$lambda, mu = pl$mu,
                     support = sp, status = pl$status, lambda_raw = lr0, mu_raw = mr0, stringsAsFactors = FALSE)
@@ -226,7 +234,9 @@ lrmap_leak <- function(counts, coords, types, lib = NULL, genes = NULL, spill_ed
 .leak_table <- function(leak) {
   if (inherits(leak, "EdgeICG")) {
     P <- leak$pairs
-    return(data.frame(receiver = leak$types[P$receiver], sender = leak$types[P$sender], lambda = P$lambda, mu = P$mu))
+    df <- data.frame(receiver = leak$types[P$receiver], sender = leak$types[P$sender], lambda = P$lambda, mu = P$mu)
+    if (!is.null(P$leak_status)) df$status <- P$leak_status              # pooled by edgeicg: used as given
+    return(df)
   }
   df <- as.data.frame(leak)
   if (!all(c("receiver", "sender", "lambda") %in% names(df))) stop("leak needs receiver, sender and lambda")
