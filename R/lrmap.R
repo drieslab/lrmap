@@ -470,7 +470,7 @@ lrmap_results <- function(x, scale = c("contact", "paracrine", "niche", "express
   qq <- switch(test, type = tb$q_type, shuffle = tb$q_shuffle, colocation = tb$q)
   ff <- if (test == "colocation") tb$fold else tb$fold_type
   qq[ex] <- tb$q[ex]; ff[ex] <- tb$fold[ex]
-  !is.na(qq) & qq < q_thr & ff >= min_fold
+  !is.na(qq) & qq < q_thr & !is.na(ff) & ff >= min_fold
 }
 
 #' @export
