@@ -10,7 +10,7 @@ test_that("the lr table: subunits, coverage, duplicates", {
 
 test_that("contact score equals a direct sum over k nearest neighbours", {
   tests <- data.frame(A = 1L, Bt = 2L, p = 1L, li = 1L, ri = 2L)
-  S <- lrmap:::.scores_contact(sim$coords, tc, 4, Y, Y, tests, rbind(c(0, 0), c(200, 100)), box, 8)
+  S <- lrmap:::.scores_contact(sim$coords, tc, 4, Y, Y, tests, rbind(c(0, 0), c(200, 100)), box, 8, Y * 0, Y * 0)$S
   nn <- RANN::nn2(sim$coords, k = 9); d0 <- median(nn$nn.dists[, -1]); cap <- 3 * d0
   b <- which(tc == 2); num <- 0; nv <- 0
   for (i in b) {
@@ -51,7 +51,7 @@ test_that("leak removal recovers the expression before leak (first order)", {
   d <- as.vector(nn$nn.dists[, -1]); w <- exp(-d / median(d)); wn <- w / lrmap:::.rsum(w, recv, n)[recv]
   Wl <- Matrix::sparseMatrix(i = recv, j = send, x = wn * 0.05 * (tcs[recv] != tcs[send]), dims = c(n, n))
   Yl <- E + as.matrix(Wl %*% E)
-  Yc <- lrmap:::.unleak(Yl, tcs, 4, s$coords, 8, lm)
+  Yc <- lrmap:::.unleak(Yl, tcs, 4, s$coords, 8, lm, s$lib)$Y
   b <- tcs == 2
   expect_lt(max(abs(Yc[b] - E[b])), 0.01 * max(Yl[b]))            # second-order remainder only
 })
