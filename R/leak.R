@@ -104,6 +104,28 @@ LEAK_DEF <- list(k = 8, sigma_p = 25, sigma_n = 150, bin = 10, max_k = 400, min_
   list(lam = co[1], mu = co[2])
 }
 
+# Pool leak coefficients across receiver-sender pairs. Each usable estimate (lambda in [0, 1], mu in [-1, 1]) is
+# shrunk toward the pooled value of its receiver type with weight support / (support + S0); pairs without a usable
+# estimate get the pooled value. Pooled value: median over the well-supported pairs (support >= S0) of the same
+# receiver type, else over all well-supported pairs; pool = "q1" uses the first quartile for lambda (mu: median).
+# pool = "none": no pooling, pairs with support < S0 or without a usable estimate are not corrected (NA).
+.leak_pool <- function(recv, lam, mu, support, pool = "median", S0 = LEAK_DEF$min_support) {
+  usable <- !is.na(lam) & !is.na(mu) & lam >= 0 & lam <= 1 & mu >= -1 & mu <= 1
+  good <- usable & !is.na(support) & support >= S0
+  status <- ifelse(usable, ifelse(good, "ok", "low support"), ifelse(is.na(lam), "no estimate", "out of range"))
+  if (pool == "none" || !any(good)) {
+    if (pool != "none") warning("no receiver-sender pair has enough contact to pool leak coefficients; low-support pairs are not corrected")
+    return(list(lambda = ifelse(good, lam, NA_real_), mu = ifelse(good, mu, NA_real_), status = status))
+  }
+  ql <- if (pool == "q1") function(x) stats::quantile(x, 0.25, names = FALSE) else stats::median
+  by_r <- function(x, f) { g <- f(x[good]); vapply(recv, function(r) { w <- good & recv == r; if (any(w)) f(x[w]) else g }, 0) }
+  pl <- by_r(lam, ql); pm <- by_r(mu, stats::median)
+  s <- ifelse(usable & !is.na(support), support, 0); wt <- s / (s + S0)
+  l2 <- ifelse(usable, wt * lam + (1 - wt) * pl, pl); m2 <- ifelse(usable, wt * mu + (1 - wt) * pm, pm)
+  status[status != "ok"] <- paste0("pooled: ", status[status != "ok"])
+  list(lambda = l2, mu = m2, status = status)
+}
+
 #' Estimate leak (spillover) coefficients between touching cells
 #'
 #' Fits the leak model used by lrmap (`leak = `) and by edgeICG: for each receiver type t and touching sender type
@@ -122,19 +144,24 @@ LEAK_DEF <- list(k = 8, sigma_p = 25, sigma_n = 150, bin = 10, max_k = 400, min_
 #'   from cell outlines; default: k nearest neighbours with weight exp(-d / median d).
 #' @param k,sigma_p,sigma_n,bin neighbourhood settings of the first-stage regression.
 #' @param min_cells receiver types with fewer cells are not fitted. @param min_det gene filter (see `genes`).
-#' @param min_support a receiver-sender pair is estimated only when the receivers' contact shares of the sender
-#'   type sum to at least this (about this many fully touching receivers); otherwise `lambda` and `mu` are NA
-#'   (no correction). Estimates outside the physical range (`lambda` in [0, 1], `mu` in [-1, 1]) are also set to
-#'   NA and flagged.
+#' @param min_support contact support (the receivers' contact shares of the sender type, summed: about the
+#'   number of fully touching receivers) at which a pair's own estimate gets half the weight in pooling.
+#' @param pool how pairs with little contact are handled. "median" (default): every pair's estimate is shrunk
+#'   toward the median of the well-supported pairs (support >= `min_support`) of its receiver type (all
+#'   well-supported pairs if it has none), with weight support / (support + `min_support`); pairs without a usable
+#'   estimate (little contact, outside the physical range `lambda` in [0, 1], `mu` in [-1, 1], or a receiver type
+#'   too small to fit) get that median. "q1": the same with the first quartile for `lambda` (less correction).
+#'   "none": no pooling; pairs with support below `min_support` or without a usable estimate are not corrected.
 #' @param block genes read and fitted at a time. @param verbose progress messages.
-#' @return data.frame with `receiver`, `sender`, `lambda`, `mu`, `support` (summed contact share), `status`
-#'   ("ok", "low support", "out of range", "no contact" or "not fitted"; raw estimates of flagged pairs in
-#'   `lambda_raw`, `mu_raw`), attribute `n_genes`.
+#' @return data.frame with `receiver`, `sender`, `lambda`, `mu` (used for the correction), `support`, `status`
+#'   ("ok", "low support", "out of range" or "no estimate", prefixed "pooled: " when the pooled value was used),
+#'   and the pair's own estimates `lambda_raw`, `mu_raw`; attributes `n_genes`, `pool`.
 #' @export
 lrmap_leak <- function(counts, coords, types, lib = NULL, genes = NULL, spill_edges = NULL, k = LEAK_DEF$k,
                        sigma_p = LEAK_DEF$sigma_p, sigma_n = LEAK_DEF$sigma_n, bin = LEAK_DEF$bin,
                        min_cells = LEAK_DEF$min_cells, min_det = LEAK_DEF$min_det, min_support = LEAK_DEF$min_support,
-                       block = 300L, verbose = TRUE) {
+                       pool = c("median", "q1", "none"), block = 300L, verbose = TRUE) {
+  pool <- match.arg(pool)
   t0 <- proc.time()[[3]]
   say <- function(...) if (verbose) message(sprintf("[lrmap_leak %5.0f s] ", proc.time()[[3]] - t0), sprintf(...))
   coords <- as.matrix(coords)[, 1:2, drop = FALSE]; n <- nrow(coords)
@@ -146,8 +173,7 @@ lrmap_leak <- function(counts, coords, types, lib = NULL, genes = NULL, spill_ed
   lib <- pmax(as.numeric(lib), 1)
   o <- utils::modifyList(LEAK_DEF, list(k = k, sigma_p = sigma_p, sigma_n = sigma_n, bin = bin))
   ex <- .lk_exposures(coords, tcode, K, o); ds <- .lk_designs(ex, tcode, K, lib, min_cells)
-  support <- vapply(seq_len(nrow(ds$pairs)), function(p) sum(ex$C[tcode == ds$pairs$receiver[p], ds$pairs$sender[p]]), 0)
-  rm(ex)
+  Csum <- rowsum(ex$C, tcode)[as.character(seq_len(K)), , drop = FALSE]; rm(ex)
   pairs <- ds$pairs; P_n <- nrow(pairs); fitted <- ds$fitted
   ct <- .lk_edges(coords, k, spill_edges)
   wn <- ct$w / pmax(.rsum(ct$w, ct$recv, n)[ct$recv], EPS); tr <- tcode[ct$recv]; ts <- tcode[ct$send]
@@ -186,21 +212,14 @@ lrmap_leak <- function(counts, coords, types, lib = NULL, genes = NULL, spill_ed
     lam[p] <- dc$lam; mu[p] <- dc$mu
   }
   say("done: %d genes", ncol(a))
-  status <- ifelse(is.na(lam), "no contact", "ok")
-  status[status == "ok" & support < min_support] <- "low support"
-  status[status == "ok" & (lam < 0 | lam > 1 | mu < -1 | mu > 1)] <- "out of range"
-  bad <- status != "ok"
-  if (any(status == "out of range")) warning(sum(status == "out of range"), " leak estimate(s) outside the physical range set to NA")
-  out <- data.frame(receiver = lev[pairs$receiver], sender = lev[pairs$sender], lambda = ifelse(bad, NA_real_, lam),
-                    mu = ifelse(bad, NA_real_, mu), support = support, status = status, lambda_raw = lam, mu_raw = mu,
-                    stringsAsFactors = FALSE)
-  nf <- setdiff(seq_len(K), ds$fitted)                                  # receiver types too small to fit
-  if (length(nf)) {
-    ex <- expand.grid(receiver = lev[nf], sender = lev, stringsAsFactors = FALSE); ex <- ex[ex$receiver != ex$sender, ]
-    out <- rbind(out, data.frame(ex, lambda = NA_real_, mu = NA_real_, support = NA_real_, status = "not fitted",
-                                 lambda_raw = NA_real_, mu_raw = NA_real_))
-  }
-  structure(out, n_genes = ncol(a))
+  full <- expand.grid(receiver = seq_len(K), sender = seq_len(K)); full <- full[full$receiver != full$sender, ]
+  m <- match(paste(full$receiver, full$sender), paste(pairs$receiver, pairs$sender))
+  lr0 <- lam[m]; mr0 <- mu[m]; sp <- Csum[cbind(full$receiver, full$sender)]
+  pl <- .leak_pool(full$receiver, lr0, mr0, sp, pool, min_support)
+  out <- data.frame(receiver = lev[full$receiver], sender = lev[full$sender], lambda = pl$lambda, mu = pl$mu,
+                    support = sp, status = pl$status, lambda_raw = lr0, mu_raw = mr0, stringsAsFactors = FALSE)
+  out <- out[order(out$receiver, out$sender), ]; rownames(out) <- NULL
+  structure(out, n_genes = ncol(a), pool = pool)
 }
 
 # leak table from a data.frame or an edgeicg fit (read by field names; edgeicg is not needed)

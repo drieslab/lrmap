@@ -151,14 +151,19 @@ test_that("fold is NA, not huge, when the expectation is not positive", {
   expect_equal(lrmap:::.ratio(c(1, -2, 3), c(2, 0, -1)), c(0.5, NA, NA))
 })
 
-test_that("leak pairs with little contact or out-of-range estimates are not corrected", {
+test_that("leak pooling: low-contact pairs get the receiver's pooled value; pool = 'none' leaves them uncorrected", {
   s <- lrmap_simulate("touch", size = 900, n_clusters = 8, leak = 0.08, n_genes = 150, seed = 6)
   lk <- lrmap_leak(s$counts, s$coords, s$types, s$lib, min_cells = 30, verbose = FALSE)
-  expect_true(all(is.na(lk$lambda[lk$status != "ok"])))
-  expect_true(all(lk$support[lk$status == "ok"] >= 30))
-  lk2 <- lrmap_leak(s$counts, s$coords, s$types, s$lib, min_cells = 30, min_support = 1e9, verbose = FALSE)
-  expect_true(all(lk2$status %in% c("low support", "no contact")))
-  # lrmap ignores supplied coefficients that are out of range: same result as without them
+  expect_false(anyNA(lk$lambda)); expect_true(all(lk$lambda >= 0 & lk$lambda <= 1))
+  ok <- lk$status == "ok"; expect_true(all(lk$support[ok] >= 30))
+  w <- lk$support[ok] / (lk$support[ok] + 30)                          # shrinkage weight of the pair's own estimate
+  pooled <- (lk$lambda[ok] - w * lk$lambda_raw[ok]) / (1 - w)
+  expect_true(all(pooled >= min(lk$lambda_raw[ok]) - 1e-12 & pooled <= max(lk$lambda_raw[ok]) + 1e-12))
+  ln <- lrmap_leak(s$counts, s$coords, s$types, s$lib, min_cells = 30, pool = "none", verbose = FALSE)
+  expect_true(all(is.na(ln$lambda[ln$status != "ok"]))); expect_equal(ln$lambda[ln$status == "ok"], ln$lambda_raw[ln$status == "ok"])
+  q1 <- lrmap_leak(s$counts, s$coords, s$types, s$lib, min_cells = 30, pool = "q1", verbose = FALSE)
+  expect_true(all(q1$lambda[q1$status != "ok"] <= lk$lambda[lk$status != "ok"] + 1e-12))
+  # lrmap: supplied coefficients all outside the physical range are not used (same result as without leak)
   bad <- s$leak; bad$lambda <- 5; bad$mu <- 0
   f0 <- lrmap(s$counts, s$coords, s$types, s$lr, lib = s$lib, B = 5, min_shift = 150, scales = "contact", verbose = FALSE)
   f1 <- lrmap(s$counts, s$coords, s$types, s$lr, lib = s$lib, B = 5, min_shift = 150, scales = "contact", leak = bad, verbose = FALSE)

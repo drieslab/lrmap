@@ -45,6 +45,8 @@
 #'   needed), or `TRUE` to estimate them with [lrmap_leak()] on all genes of `counts` (matrix input only).
 #'   Transcripts leaked from touching cells of other types are removed from every gene before ligand and receptor
 #'   values are formed: y - sum_j wn_ij lambda y_j - cmu_i a_t, with a_t the receiver type's first-stage baseline.
+#' @param leak_pool how leak coefficients of pairs with little contact are pooled when `leak` is an edgeICG fit or
+#'   a plain table (see [lrmap_leak()], argument `pool`); tables from [lrmap_leak()] are used as given.
 #' @param spill_edges optional touching edges for the leak correction (`recv`, `send`, `w`; cell indices in the
 #'   order of `coords`), e.g. from cell outlines; default: the k nearest neighbours, weight exp(-d / median d).
 #' @param chunk ligands blurred at a time; default from the grid size (about `grid_mem` numbers per chunk).
@@ -67,9 +69,9 @@
 #' @export
 lrmap <- function(counts, coords, types, lr, lib = NULL, scales = c("contact", "paracrine", "niche"), k = 8,
                   sigma_p = 25, sigma_n = 150, bin_p = 8, bin_n = 25, B = 200L, min_shift = 450, min_det = 0.05,
-                  min_cells = 30L, same_type = FALSE, leak = NULL, spill_edges = NULL, chunk = NULL, grid_mem = 4e7, z_cand = 1.5,
+                  min_cells = 30L, same_type = FALSE, leak = NULL, leak_pool = c("median", "q1", "none"), spill_edges = NULL, chunk = NULL, grid_mem = 4e7, z_cand = 1.5,
                   backend = c("auto", "rust", "r"), threads = 1L, seed = 1L, verbose = TRUE) {
-  backend <- match.arg(backend); has_rs <- requireNamespace("lrmaprs", quietly = TRUE)
+  backend <- match.arg(backend); leak_pool <- match.arg(leak_pool); has_rs <- requireNamespace("lrmaprs", quietly = TRUE)
   if (backend == "rust" && !has_rs) stop("backend = 'rust' needs the lrmaprs package")
   rs <- if (backend != "r" && has_rs) as.integer(threads) else NULL
   t0 <- proc.time()[[3]]; tm <- c()
@@ -80,7 +82,7 @@ lrmap <- function(counts, coords, types, lr, lib = NULL, scales = c("contact", "
   types <- as.character(types); lev <- sort(unique(types)); K <- length(lev)
   if (isTRUE(leak)) {
     if (is.function(counts)) stop("leak = TRUE needs a counts matrix; with a reader, estimate with lrmap_leak()")
-    say("estimating leak coefficients on all genes"); leak <- lrmap_leak(counts, coords, types, lib, verbose = FALSE)
+    say("estimating leak coefficients on all genes"); leak <- lrmap_leak(counts, coords, types, lib, pool = leak_pool, verbose = FALSE)
   }
   # cells sorted by type: every type is a contiguous block
   ord <- order(match(types, lev)); tcode <- match(types, lev)[ord]; coords <- coords[ord, , drop = FALSE]
@@ -123,12 +125,18 @@ lrmap <- function(counts, coords, types, lr, lib = NULL, scales = c("contact", "
       e <- as.data.frame(spill_edges); inv <- order(ord); list(recv = inv[e$recv], send = inv[e$send], w = e$w) }
     ct <- .lk_edges(coords, k, ct)
     ex <- .lk_exposures(coords, tcode, K, utils::modifyList(LEAK_DEF, list(k = k)), rs)
-    lm <- .leak_mats(leak, lev); sup <- rowsum(ex$C, tcode)[as.character(seq_len(K)), , drop = FALSE]
-    off_ <- sup < LEAK_DEF$min_support | lm$lambda < 0 | lm$lambda > 1 | lm$mu < -1 | lm$mu > 1
-    off_ <- off_ & (lm$lambda != 0 | lm$mu != 0)
-    if (any(off_)) say("leak: %d receiver-sender pair(s) not corrected (contact support < %g or outside the physical range)",
-                       sum(off_), LEAK_DEF$min_support)
-    lm$lambda[off_] <- 0; lm$mu[off_] <- 0
+    # coefficients from lrmap_leak() are used as given; others (an edgeICG fit, a plain table) are pooled here
+    lt <- .leak_table(leak)
+    if (is.null(lt$status)) {
+      sup <- rowsum(ex$C, tcode)[as.character(seq_len(K)), , drop = FALSE]
+      ij <- cbind(match(lt$receiver, lev), match(lt$sender, lev)); ok <- stats::complete.cases(ij)
+      lt <- lt[ok, , drop = FALSE]; ij <- ij[ok, , drop = FALSE]
+      pl <- .leak_pool(ij[, 1], lt$lambda, lt$mu, sup[ij], leak_pool, LEAK_DEF$min_support)
+      say("leak: %d of %d receiver-sender pairs pooled (contact support < %g or no usable estimate)",
+          sum(pl$status != "ok"), nrow(lt), LEAK_DEF$min_support)
+      lt$lambda <- pl$lambda; lt$mu <- pl$mu
+    }
+    lm <- .leak_mats(lt, lev)
     lw <- .leak_W(ct, tcode, lm)
     a <- .lk_intercepts(.lk_designs(ex, tcode, K, lib, LEAK_DEF$min_cells), Y, K); a[is.na(a)] <- 0; rm(ex)
     lc <- list(WY = lw$W %*% Y, cmu = lw$cmu, a = a, W2 = lw$W2); rm(lw)
